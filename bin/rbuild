@@ -10,6 +10,7 @@
 #   rbuild                             # current branch, project defaults
 #   rbuild --ref main --out ~/.local/bin
 #   rbuild --profile dev --test        # also cargo test
+#   rbuild --profile measure           # any cargo profile the crate defines (filament: opt 1, no LTO)
 #   rbuild --target x86_64-unknown-linux-gnu -- --locked
 #   rbuild --no-cache                  # measurement: every cache cold, nothing shared
 #   rbuild cs <verb> ...               # the reserve Codespace, see rbuild-cs

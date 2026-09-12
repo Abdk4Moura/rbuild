@@ -41,11 +41,10 @@ on:
         default: x86_64-unknown-linux-musl
         type: string
       profile:
-        description: Cargo profile
+        description: Cargo profile (release, dev, or any custom profile the crate defines)
         required: false
         default: release
-        type: choice
-        options: [release, dev]
+        type: string
       features:
         description: Feature flags, passed verbatim (e.g. "--features static")
         required: false
@@ -183,10 +182,11 @@ jobs:
           export FILAMENT_BUILD_SHA="$(git rev-parse --short HEAD)"
           export FILAMENT_BUILD_DATE="$(date -u +%Y-%m-%d)"
           export RBUILD_SHA="$FILAMENT_BUILD_SHA"
-          PROFILE_FLAG=""; OUTDIR="debug"
-          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; OUTDIR="release"; fi
+          # Any profile works via --profile; cargo names the output dir after
+          # the profile, except `dev` which lands in `debug`.
+          PROFILE="${{ inputs.profile }}"; OUTDIR="$PROFILE"; [ "$PROFILE" = "dev" ] && OUTDIR="debug"
           start=$(date +%s)
-          cargo build $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }} ${{ inputs.cargo_args }}
+          cargo build --profile "$PROFILE" --target "${{ inputs.target }}" ${{ inputs.features }} ${{ inputs.cargo_args }}
           echo "build_seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
           echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
       - name: Test
@@ -194,9 +194,7 @@ jobs:
         working-directory: ${{ inputs.manifest_dir }}
         shell: bash
         run: |
-          PROFILE_FLAG=""
-          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; fi
-          cargo test $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }}
+          cargo test --profile "${{ inputs.profile }}" --target "${{ inputs.target }}" ${{ inputs.features }}
       - name: Stage artifact
         shell: bash
         run: |
