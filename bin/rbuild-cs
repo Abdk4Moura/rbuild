@@ -147,8 +147,18 @@ cmd_fetch() {
         | jq -r 'select(.reason==\"compiler-artifact\" and .executable!=null) | .executable' | tail -1
     fi" | tail -1)"
   [ -n "$src" ] || { echo "rbuild-cs: could not locate the built binary on the codespace (run 'rbuild cs build' first)" >&2; return 1; }
-  gh codespace cp -c "$CS" "remote:$src" "$OUT/$BIN"
-  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN  (from $src)"
+  # Stream over the ssh channel rather than `gh codespace cp`: on this box the
+  # cp/scp path fails with "No such file or directory" even for /etc/hostname.
+  # base64 keeps it tty-safe; sha256 on both ends proves the bytes arrived.
+  local want got
+  want="$(remote "sha256sum '$src' | cut -d' ' -f1" | tail -1)"
+  gh codespace ssh -c "$CS" -- "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.part"
+  got="$(sha256sum "$OUT/$BIN.part" | cut -d' ' -f1)"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "rbuild-cs: checksum mismatch fetching $src (remote ${want:0:12} local ${got:0:12})" >&2; rm -f "$OUT/$BIN.part"; return 1
+  fi
+  mv "$OUT/$BIN.part" "$OUT/$BIN"; chmod +x "$OUT/$BIN"
+  echo "rbuild-cs: binary -> $OUT/$BIN  (from $src, sha256 ${got:0:12})"
 }
 
 cmd_sync() {
