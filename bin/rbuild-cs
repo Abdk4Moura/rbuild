@@ -13,6 +13,7 @@
 #   rbuild cs fetch [--out DIR]    # copy the binary back
 #   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
 #   rbuild cs sync                 # rsync the working tree over (uncommitted ok)
+#   rbuild cs dev [--check] [--fetch] [-- cargo args]   # THE LOOP: sync + incremental dev build/check, timed
 #   rbuild cs sh [cmd...]          # interactive shell, or one command
 #   rbuild cs clean                # remove target/ dirs on the codespace
 #   rbuild cs down                 # stop it (ALWAYS, when done)
@@ -95,6 +96,13 @@ cmd_up() {
     fi
     if [ ! -d '$CS_DIR/.git' ]; then echo 'rbuild-cs: cloning $SRC_REPO'; git clone -q '$REPO_URL' '$CS_DIR'; fi
     cd '$CS_DIR' && git fetch -q origin
+    # Fast linker by default on the codespace (user-level config, the repo's
+    # own .cargo/config.toml is left alone). Relinking dominated the old loop.
+    if ! command -v mold >/dev/null 2>&1; then sudo apt-get install -y -q mold >/dev/null 2>&1 && echo 'rbuild-cs: installed mold'; fi
+    if command -v mold >/dev/null 2>&1 && ! grep -qs 'fuse-ld=mold' \"\$HOME/.cargo/config.toml\"; then
+      mkdir -p \"\$HOME/.cargo\"; printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n' >> \"\$HOME/.cargo/config.toml\"
+      echo 'rbuild-cs: mold set as linker in ~/.cargo/config.toml'
+    fi
     # Stable unless the project pins its own toolchain.
     if [ ! -f rust-toolchain ] && [ ! -f rust-toolchain.toml ] && [ ! -f '$MANIFEST_DIR/rust-toolchain' ] && [ ! -f '$MANIFEST_DIR/rust-toolchain.toml' ]; then
       rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal >/dev/null
@@ -177,6 +185,26 @@ cmd_sync() {
   rm -f "$cfg"
 }
 
+# The inner loop: rsync the working tree over (uncommitted edits included),
+# then an incremental dev build (or --check) on the warm target dir. Prints
+# the seconds so a slow step is visible, and fetches the binary with --fetch.
+cmd_dev() {
+  local mode="build" fetch=false args=()
+  for a in "${EXTRA[@]}"; do case "$a" in --check) mode="check" ;; --fetch) fetch=true ;; *) args+=("$a") ;; esac; done
+  local t0; t0=$(date +%s)
+  EXTRA=(); cmd_sync
+  local t1; t1=$(date +%s)
+  remote "
+    cd '$CS_DIR/$MANIFEST_DIR' && s=\$SECONDS
+    cargo $mode --profile dev ${args[*]:-} 2>&1 | grep -vE '^\s*(Compiling|Checking|Downloaded|Downloading|Updating|Blocking)' | tail -40
+    echo \"rbuild-cs: cargo $mode \$((SECONDS-s)) s\""
+  echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
+  if [ "$fetch" = true ] && [ "$mode" = build ]; then
+    OUT="$OUT" EXTRA=() ; local src="$CS_DIR/$MANIFEST_DIR/target/debug/$BIN"
+    mkdir -p "$OUT"; gh codespace ssh -c "$CS" -- "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev"
+  fi
+}
+
 cmd_clean() {
   remote "
     for d in /workspaces/*/target /workspaces/*/*/target; do
@@ -196,6 +224,7 @@ case "$VERB" in
   fetch)  cmd_fetch ;;
   run)    trap 'cmd_down' EXIT; cmd_build; cmd_fetch ;;
   sync)   cmd_sync ;;
+  dev)    cmd_dev ;;
   sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"; else gh codespace ssh -c "$CS"; fi ;;
   clean)  cmd_clean ;;
   down)   cmd_down ;;
