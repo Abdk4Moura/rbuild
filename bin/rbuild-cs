@@ -62,6 +62,16 @@ ssh_cfg() {
 }
 ssh_host() { awk '/^Host /{print $2; exit}' "$1"; }
 
+# Copy one remote file here. rsync over the multiplexed tunnel compresses and
+# sends only changed blocks against the previous copy (a rebuilt binary is
+# mostly identical), so a 100 MB debug binary refreshes in seconds; base64
+# streaming is the fallback when rsync is missing on either side.
+fetch_file() {
+  local src="$1" dst="$2" cfg host; cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
+  if command -v rsync >/dev/null 2>&1 && rsync -az --inplace -e "ssh -F $cfg" "$host:$src" "$dst" 2>/dev/null; then return 0; fi
+  ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"
+}
+
 # Run a script on the codespace. gh starts a stopped codespace implicitly.
 # The script travels base64-encoded as ONE argument, so quoting and newlines
 # never reach the remote shell's argv (the naive multi-line `bash -lc "..."`
@@ -199,7 +209,7 @@ cmd_fetch() {
   # base64 keeps it tty-safe; sha256 on both ends proves the bytes arrived.
   local want got
   want="$(remote "sha256sum '$src' | cut -d' ' -f1" | tail -1)"
-  local cfg; cfg="$(ssh_cfg)"; ssh -F "$cfg" "$(ssh_host "$cfg")" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.part"
+  fetch_file "$src" "$OUT/$BIN.part"
   got="$(sha256sum "$OUT/$BIN.part" | cut -d' ' -f1)"
   if [ -z "$want" ] || [ "$want" != "$got" ]; then
     echo "rbuild-cs: checksum mismatch fetching $src (remote ${want:0:12} local ${got:0:12})" >&2; rm -f "$OUT/$BIN.part"; return 1
@@ -234,7 +244,7 @@ cmd_dev() {
   echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
   if [ "$fetch" = true ] && [ "$mode" = build ]; then
     OUT="$OUT" EXTRA=() ; local src="$CS_DIR/$MANIFEST_DIR/target/debug/$BIN"
-    mkdir -p "$OUT"; local cfg; cfg="$(ssh_cfg)"; ssh -F "$cfg" "$(ssh_host "$cfg")" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev"
+    mkdir -p "$OUT"; local t2; t2=$(date +%s); fetch_file "$src" "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev ($(du -h "$OUT/$BIN.dev" | cut -f1), fetch $(( $(date +%s) - t2 )) s)"
   fi
 }
 
