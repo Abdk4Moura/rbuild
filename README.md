@@ -43,8 +43,18 @@ A `.rbuild` file at the source repo root, `KEY=VALUE`:
 `rbuild` builds what is on GitHub. Dirty or unpushed work on the current branch
 makes it refuse; push first or pass `--force`. Output defaults to
 `~/.cache/rbuild/<owner>-<repo>/` with a `BUILD_INFO` file (sha, target,
-build seconds, run URL). Expect about a minute of queue and setup before cargo
-starts; that floor is why the Codespace exists.
+build seconds, run URL). Queue plus setup is about 20 seconds.
+
+Where the time goes, measured on filament (musl release, 4-core runner):
+cold cargo 297 s; with the target dir restored, only ~17 crates recompile yet
+the Build step still takes ~200 s, because the release profile uses fat LTO
+with one codegen unit and that final codegen + link cannot be cached. For
+functional iteration use a lighter profile the crate defines
+(`rbuild --profile measure` on filament: opt-level 1, no LTO); keep `release`
+for anything you measure or ship.
+
+Flags for measuring: `--no-cache` (every layer cold, throwaway namespaces),
+`--no-target-cache` (skip layer 1, so the sccache/R2 layer is exercised alone).
 
     rbuild cs status
     rbuild cs run --ref my-branch         # up, build, fetch, down
