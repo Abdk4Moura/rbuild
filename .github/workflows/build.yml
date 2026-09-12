@@ -1,0 +1,172 @@
+# rbuild: compile a Rust binary from any public repo at a ref on GitHub's free
+# 4-core public-repo runner, and hand it back as an artifact.
+#
+# Lives in its own repo so build runs never clutter the source repo's Actions
+# view, and so a dispatch-only workflow is registered (GitHub only registers
+# those from the default branch). Driven by bin/rbuild, which finds its run by
+# the `tag` input in the run name. Private source repos need a SOURCE_TOKEN
+# secret with contents:read on them.
+
+name: build
+
+run-name: "${{ inputs.tag }} ${{ inputs.repo }}@${{ inputs.ref }} ${{ inputs.target }} ${{ inputs.profile }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Opaque id the caller uses to find this run
+        required: true
+        type: string
+      repo:
+        description: Source repository, owner/name
+        required: true
+        type: string
+      ref:
+        description: Branch, tag, or sha to build
+        required: true
+        type: string
+      manifest_dir:
+        description: Directory containing the Cargo.toml to build
+        required: false
+        default: "."
+        type: string
+      bin:
+        description: Binary name to collect from target/
+        required: true
+        type: string
+      target:
+        description: Rust target triple
+        required: false
+        default: x86_64-unknown-linux-musl
+        type: string
+      profile:
+        description: Cargo profile
+        required: false
+        default: release
+        type: choice
+        options: [release, dev]
+      features:
+        description: Feature flags, passed verbatim (e.g. "--features static")
+        required: false
+        default: ""
+        type: string
+      cargo_args:
+        description: Extra cargo arguments, passed verbatim
+        required: false
+        default: ""
+        type: string
+      run_tests:
+        description: Also run cargo test in manifest_dir
+        required: false
+        default: false
+        type: boolean
+      retention_days:
+        description: Artifact retention in days
+        required: false
+        default: "7"
+        type: string
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+  CMAKE_C_COMPILER_LAUNCHER: sccache
+  CMAKE_CXX_COMPILER_LAUNCHER: sccache
+
+jobs:
+  build:
+    name: "${{ inputs.repo }}@${{ inputs.ref }} ${{ inputs.target }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      - name: Run sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-${{ inputs.repo }}-cargo-${{ hashFiles(format('{0}/Cargo.lock', inputs.manifest_dir)) }}
+          restore-keys: |
+            ${{ runner.os }}-${{ inputs.repo }}-cargo-
+      - name: musl toolchain
+        if: contains(inputs.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+      - name: aarch64 cross linker
+        if: startsWith(inputs.target, 'aarch64')
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu
+          mkdir -p ~/.cargo
+          printf '[target.%s]\nlinker = "aarch64-linux-gnu-gcc"\n' "${{ inputs.target }}" >> ~/.cargo/config.toml
+      - name: Toolchain
+        shell: bash
+        run: |
+          # Respect a rust-toolchain file in the source if present; else stable.
+          if [ ! -f rust-toolchain ] && [ ! -f rust-toolchain.toml ] && \
+             [ ! -f "${{ inputs.manifest_dir }}/rust-toolchain" ] && [ ! -f "${{ inputs.manifest_dir }}/rust-toolchain.toml" ]; then
+            rustup default stable
+          fi
+          rustup target add ${{ inputs.target }}
+          rustc -V; cargo -V
+      - name: Build
+        id: build
+        working-directory: ${{ inputs.manifest_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Common build-stamp env; harmless for crates that ignore it.
+          export FILAMENT_BUILD_SHA="$(git rev-parse --short HEAD)"
+          export FILAMENT_BUILD_DATE="$(date -u +%Y-%m-%d)"
+          export RBUILD_SHA="$FILAMENT_BUILD_SHA"
+          PROFILE_FLAG=""; OUTDIR="debug"
+          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; OUTDIR="release"; fi
+          start=$(date +%s)
+          cargo build $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }} ${{ inputs.cargo_args }}
+          echo "build_seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          echo "outdir=$OUTDIR" >> "$GITHUB_OUTPUT"
+      - name: Test
+        if: inputs.run_tests
+        working-directory: ${{ inputs.manifest_dir }}
+        shell: bash
+        run: |
+          PROFILE_FLAG=""
+          if [ "${{ inputs.profile }}" = "release" ]; then PROFILE_FLAG="--release"; fi
+          cargo test $PROFILE_FLAG --target "${{ inputs.target }}" ${{ inputs.features }}
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="${{ inputs.manifest_dir }}/target/${{ inputs.target }}/${{ steps.build.outputs.outdir }}/${{ inputs.bin }}"
+          mkdir -p out
+          cp "$BIN" "out/${{ inputs.bin }}"
+          {
+            echo "repo=${{ inputs.repo }}"
+            echo "ref=${{ inputs.ref }}"
+            echo "sha=$(git rev-parse HEAD)"
+            echo "bin=${{ inputs.bin }}"
+            echo "target=${{ inputs.target }}"
+            echo "profile=${{ inputs.profile }}"
+            echo "features=${{ inputs.features }}"
+            echo "cargo_args=${{ inputs.cargo_args }}"
+            echo "build_seconds=${{ steps.build.outputs.build_seconds }}"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > out/BUILD_INFO
+          ls -la out; cat out/BUILD_INFO
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.bin }}-${{ inputs.target }}-${{ inputs.profile }}
+          path: out/
+          retention-days: ${{ fromJSON(inputs.retention_days) }}
+          if-no-files-found: error
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats

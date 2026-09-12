@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# rbuild: build a Rust binary on GitHub Actions and download it.
+#
+# Dispatches the `build` workflow in the builder repo (Abdk4Moura/rbuild) for
+# the source repo of the current checkout at a ref, waits, and pulls the
+# artifact down. Free for public source repos. Needs `gh` (repo + workflow
+# scopes), `jq`, `git`. Per-project defaults come from a `.rbuild` file at the
+# source repo root (see rbuild-lib.sh).
+#
+#   rbuild                             # current branch, project defaults
+#   rbuild --ref main --out ~/.local/bin
+#   rbuild --profile dev --test        # also cargo test
+#   rbuild --target x86_64-unknown-linux-gnu -- --locked
+#   rbuild cs <verb> ...               # the reserve Codespace, see rbuild-cs
+#
+# Builds what is on GitHub, not your working tree: unpushed or dirty work on
+# the current branch makes it refuse (exit 3) unless --force. Output goes to
+# ~/.cache/rbuild/<owner>-<repo>/ by default so project trees stay clean.
+
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+[ "${1:-}" = "cs" ] && { shift; exec "$HERE/rbuild-cs" "$@"; }
+# shellcheck source=rbuild-lib.sh
+. "$HERE/rbuild-lib.sh"
+
+REF=""; PROFILE="release"; RUN_TESTS=false; RETENTION="7"; OUT=""; DOWNLOAD=true; FORCE=false
+T_FLAG=""; F_FLAG=""; EXTRA=()
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ref) REF="$2"; shift 2 ;;
+    --target) T_FLAG="$2"; shift 2 ;;
+    --profile) PROFILE="$2"; shift 2 ;;
+    --features) F_FLAG="$2"; shift 2 ;;
+    --test) RUN_TESTS=true; shift ;;
+    --retention) RETENTION="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    --no-download) DOWNLOAD=false; shift ;;
+    --force) FORCE=true; shift ;;
+    -h|--help) usage 0 ;;
+    --) shift; EXTRA=("$@"); break ;;
+    *) echo "rbuild: unknown argument: $1" >&2; usage 2 ;;
+  esac
+done
+
+rb_load_config
+[ -n "$T_FLAG" ] && TARGET="$T_FLAG"
+[ -n "$F_FLAG" ] && FEATURES="$F_FLAG"
+[ -n "$SRC_REPO" ] || { echo "rbuild: not in a GitHub checkout; set RBUILD_REPO=owner/name" >&2; exit 2; }
+cd "$ROOT"
+[ -n "$REF" ] || REF="$(git rev-parse --abbrev-ref HEAD)"
+[ -n "$OUT" ] || OUT="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/${SRC_REPO/\//-}"
+
+if [ "$FORCE" = false ] && [ "$REF" = "$(git rev-parse --abbrev-ref HEAD)" ]; then
+  dirty="$(git status --porcelain --untracked-files=no | wc -l)"
+  git fetch -q origin "$REF" 2>/dev/null || true
+  local_sha="$(git rev-parse HEAD)"; remote_sha="$(git rev-parse "origin/$REF" 2>/dev/null || echo none)"
+  if [ "$dirty" != "0" ]; then
+    echo "rbuild: $dirty tracked file(s) modified locally; the remote build will not include them." >&2
+    echo "        Commit and push, or --force to build origin/$REF as-is." >&2; exit 3
+  fi
+  if [ "$local_sha" != "$remote_sha" ]; then
+    echo "rbuild: local $REF is ${local_sha:0:7} but origin/$REF is ${remote_sha:0:7}. Push first, or --force." >&2; exit 3
+  fi
+fi
+
+TAG="$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
+t0=$(date +%s)
+echo "rbuild: $SRC_REPO@$REF  $MANIFEST_DIR/$BIN  $TARGET $PROFILE  (builder $DISPATCH_REPO, tag $TAG)"
+gh workflow run build.yml -R "$DISPATCH_REPO" \
+  -f "tag=$TAG" -f "repo=$SRC_REPO" -f "ref=$REF" -f "manifest_dir=$MANIFEST_DIR" -f "bin=$BIN" \
+  -f "target=$TARGET" -f "profile=$PROFILE" -f "features=$FEATURES" -f "cargo_args=${EXTRA[*]:-}" \
+  -f "run_tests=$RUN_TESTS" -f "retention_days=$RETENTION"
+
+RUN_ID=""
+for _ in $(seq 1 30); do
+  RUN_ID="$(gh run list -R "$DISPATCH_REPO" --workflow build.yml --event workflow_dispatch \
+              --json databaseId,displayTitle --limit 20 \
+              --jq ".[] | select(.displayTitle | startswith(\"$TAG \")) | .databaseId" | head -1)"
+  [ -n "$RUN_ID" ] && break
+  sleep 2
+done
+[ -n "$RUN_ID" ] || { echo "rbuild: dispatched but could not find run tagged $TAG" >&2; exit 4; }
+echo "rbuild: run https://github.com/$DISPATCH_REPO/actions/runs/$RUN_ID"
+
+set +e; gh run watch "$RUN_ID" -R "$DISPATCH_REPO" --exit-status --interval 5 >/dev/null; status=$?; set -e
+t1=$(date +%s)
+gh run view "$RUN_ID" -R "$DISPATCH_REPO" --json jobs,conclusion,createdAt --jq '
+  .jobs[0] as $j |
+  "rbuild: \(.conclusion)  queue \(( ($j.startedAt|fromdateiso8601) - (.createdAt|fromdateiso8601) ))s  job \(( ($j.completedAt|fromdateiso8601) - ($j.startedAt|fromdateiso8601) ))s",
+  ($j.steps[] | select(.name == "Build" or .name == "Test" or .name == "Run sccache" or .name == "Cache cargo registry" or .name == "Toolchain")
+     | "rbuild:   \(.name): \(( (.completedAt|fromdateiso8601) - (.startedAt|fromdateiso8601) ))s")
+' 2>/dev/null || true
+echo "rbuild: wall $((t1 - t0))s dispatch to finish"
+
+if [ "$status" -ne 0 ]; then
+  echo "rbuild: FAILED, last log lines:" >&2
+  gh run view "$RUN_ID" -R "$DISPATCH_REPO" --log-failed 2>/dev/null | tail -40 >&2 || true
+  exit "$status"
+fi
+if [ "$DOWNLOAD" = true ]; then
+  mkdir -p "$OUT"; tmp="$(mktemp -d)"
+  gh run download "$RUN_ID" -R "$DISPATCH_REPO" -n "$BIN-$TARGET-$PROFILE" -D "$tmp"
+  install -m 0755 "$tmp/$BIN" "$OUT/$BIN"; cp "$tmp/BUILD_INFO" "$OUT/BUILD_INFO"; rm -rf "$tmp"
+  echo "rbuild: binary -> $OUT/$BIN"
+  sed 's/^/rbuild:   /' "$OUT/BUILD_INFO"
+fi

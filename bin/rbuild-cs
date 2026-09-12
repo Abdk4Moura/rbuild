@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# rbuild-cs: the reserve Codespace for interactive Rust work.
+#
+# Codespaces hours are metered, so the default build path is `rbuild` (free
+# Actions runner). This is for what Actions cannot do: a tight edit/compile
+# loop, debugging a failing test, poking at a live binary. It reuses ONE
+# existing Codespace (never creates one), keeps the source repo cloned on its
+# disk so builds stay incremental, and always hands you a `down`.
+#
+#   rbuild cs status               # state, disk, toolchain, checkout
+#   rbuild cs up                   # start, clone/refresh, ensure stable toolchain
+#   rbuild cs build [--ref R] [-- cargo args]        # up + cargo build --release
+#   rbuild cs fetch [--out DIR]    # copy the binary back
+#   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
+#   rbuild cs sync                 # rsync the working tree over (uncommitted ok)
+#   rbuild cs sh [cmd...]          # interactive shell, or one command
+#   rbuild cs clean                # remove target/ dirs on the codespace
+#   rbuild cs down                 # stop it (ALWAYS, when done)
+#
+# CS and CS_DIR come from .rbuild or RBUILD_CS / RBUILD_CS_DIR. The idle
+# timeout (30 min) cannot be changed with gh; it is the safety net, `down` is
+# the rule.
+
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+# shellcheck source=rbuild-lib.sh
+. "$HERE/rbuild-lib.sh"
+
+REF=""; OUT=""; EXTRA=()
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+VERB="${1:-status}"; shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ref) REF="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    --) shift; EXTRA=("$@"); break ;;
+    *) EXTRA+=("$1"); shift ;;
+  esac
+done
+rb_load_config
+[ -n "$CS" ] || { echo "rbuild-cs: no codespace configured (CS= in .rbuild or RBUILD_CS)" >&2; exit 2; }
+REPO_URL="https://github.com/$SRC_REPO.git"
+[ -n "$OUT" ] || OUT="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/${SRC_REPO/\//-}"
+
+# Run a script on the codespace. gh starts a stopped codespace implicitly.
+# The script travels base64-encoded as ONE argument, so quoting and newlines
+# never reach the remote shell's argv (the naive multi-line `bash -lc "..."`
+# form trips "bash: -c: option requires an argument"). ~/.cargo/env is sourced
+# because the codespace login PATH does not include ~/.cargo/bin.
+remote() {
+  local b64; b64="$(printf '%s\n' '. "$HOME/.cargo/env" 2>/dev/null || true' "$1" | base64 -w0)"
+  gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -s" 2>&1 | grep -v '^#\+ *[0-9.]*%\|No default node version\|use .nvs link'
+}
+state() { gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown; }
+
+cmd_status() {
+  gh codespace view -c "$CS"
+  if [ "$(state)" = "Available" ]; then
+    echo "--- remote"
+    remote "
+      df -h /workspaces | tail -1 | awk '{print \"disk: \"\$3\" used / \"\$2\" (\"\$5\"), \"\$4\" free\"}'
+      for t in /workspaces/*/target /workspaces/*/*/target; do [ -d \"\$t\" ] && echo \"target: \$(du -sh \"\$t\" | cut -f1) \$t\"; done
+      if [ -d '$CS_DIR/.git' ]; then cd '$CS_DIR' && echo \"checkout: \$(git rev-parse --abbrev-ref HEAD) \$(git rev-parse --short HEAD)\"; else echo 'checkout: none'; fi
+      command -v cargo >/dev/null && (cd '$CS_DIR' 2>/dev/null || cd /; echo \"cargo: \$(cargo --version)\") || echo 'cargo: MISSING'
+      echo \"cores: \$(nproc)\""
+  else
+    echo "(stopped: 'rbuild cs up' to start)"
+  fi
+}
+
+cmd_up() {
+  echo "rbuild-cs: starting $CS (state: $(state))"; local t0; t0=$(date +%s)
+  remote "
+    set -e
+    if ! command -v rustup >/dev/null 2>&1; then
+      echo 'rbuild-cs: installing rustup'
+      curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
+      . \"\$HOME/.cargo/env\"
+    fi
+    if [ ! -d '$CS_DIR/.git' ]; then echo 'rbuild-cs: cloning $SRC_REPO'; git clone -q '$REPO_URL' '$CS_DIR'; fi
+    cd '$CS_DIR' && git fetch -q origin
+    # Stable unless the project pins its own toolchain.
+    if [ ! -f rust-toolchain ] && [ ! -f rust-toolchain.toml ] && [ ! -f '$MANIFEST_DIR/rust-toolchain' ] && [ ! -f '$MANIFEST_DIR/rust-toolchain.toml' ]; then
+      rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal >/dev/null
+      rustup override list 2>/dev/null | grep -q \"^$CS_DIR\" || rustup override set stable >/dev/null
+    fi
+    echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h /workspaces | tail -1 | awk '{print \$4}') free\""
+  echo "rbuild-cs: up in $(( $(date +%s) - t0 ))s"
+}
+
+cmd_build() {
+  cmd_up
+  [ -n "$REF" ] || REF="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  echo "rbuild-cs: building $SRC_REPO@$REF: cargo build --release $FEATURES ${EXTRA[*]:-}"; local t0; t0=$(date +%s)
+  remote "
+    set -e
+    cd '$CS_DIR' && git fetch -q origin '$REF' && git checkout -q --detach FETCH_HEAD
+    echo \"rbuild-cs: at \$(git rev-parse --short HEAD)\"
+    export FILAMENT_BUILD_SHA=\$(git rev-parse --short HEAD) FILAMENT_BUILD_DATE=\$(date -u +%F) RBUILD_SHA=\$(git rev-parse --short HEAD)
+    cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}"
+  echo "rbuild-cs: build took $(( $(date +%s) - t0 ))s"
+}
+
+cmd_fetch() {
+  mkdir -p "$OUT"
+  gh codespace cp -c "$CS" "remote:$CS_DIR/$MANIFEST_DIR/target/release/$BIN" "$OUT/$BIN"
+  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN"
+}
+
+cmd_sync() {
+  rb_need rsync
+  local cfg host; cfg="$(mktemp)"; gh codespace ssh -c "$CS" --config > "$cfg"
+  host="$(awk '/^Host /{print $2; exit}' "$cfg")"
+  echo "rbuild-cs: rsync $ROOT/ -> $host:$CS_DIR/"
+  rsync -az --delete -e "ssh -F $cfg" --exclude .git --exclude target --exclude node_modules "$ROOT/" "$host:$CS_DIR/"
+  rm -f "$cfg"
+}
+
+cmd_clean() {
+  remote "
+    for d in /workspaces/*/target /workspaces/*/*/target; do
+      [ -d \"\$d\" ] && { echo \"rbuild-cs: removing \$(du -sh \"\$d\" | cut -f1) \$d\"; rm -rf \"\$d\"; }
+    done; df -h /workspaces | tail -1 | awk '{print \"rbuild-cs: \"\$4\" free\"}'"
+}
+
+cmd_down() {
+  if [ "$(state)" = "Shutdown" ]; then echo "rbuild-cs: already stopped"; return; fi
+  gh codespace stop -c "$CS"; echo "rbuild-cs: stopped $CS"
+}
+
+case "$VERB" in
+  status) cmd_status ;;
+  up)     cmd_up ;;
+  build)  cmd_build ;;
+  fetch)  cmd_fetch ;;
+  run)    trap 'cmd_down' EXIT; cmd_build; cmd_fetch ;;
+  sync)   cmd_sync ;;
+  sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"; else gh codespace ssh -c "$CS"; fi ;;
+  clean)  cmd_clean ;;
+  down)   cmd_down ;;
+  -h|--help|help) usage 0 ;;
+  *) echo "rbuild-cs: unknown verb $VERB" >&2; usage 2 ;;
+esac
