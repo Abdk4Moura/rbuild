@@ -55,10 +55,12 @@ rb_load_config
 [ -n "$F_FLAG" ] && FEATURES="$F_FLAG"
 [ -n "$SRC_REPO" ] || { echo "rbuild: not in a GitHub checkout; set RBUILD_REPO=owner/name" >&2; exit 2; }
 cd "$ROOT"
-[ -n "$REF" ] || REF="$(git rev-parse --abbrev-ref HEAD)"
+REF_GIVEN=true; [ -n "$REF" ] || { REF="$(git rev-parse --abbrev-ref HEAD)"; REF_GIVEN=false; }
 [ -n "$OUT" ] || OUT="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/${SRC_REPO/\//-}"
 
-if [ "$FORCE" = false ] && [ "$REF" = "$(git rev-parse --abbrev-ref HEAD)" ]; then
+# The stale-tree guard protects the IMPLICIT case ("build what I'm looking
+# at"). An explicit --ref names what to build; local edits are irrelevant.
+if [ "$FORCE" = false ] && [ "$REF_GIVEN" = false ]; then
   dirty="$(git status --porcelain --untracked-files=no | wc -l)"
   git fetch -q origin "$REF" 2>/dev/null || true
   local_sha="$(git rev-parse HEAD)"; remote_sha="$(git rev-parse "origin/$REF" 2>/dev/null || echo none)"
