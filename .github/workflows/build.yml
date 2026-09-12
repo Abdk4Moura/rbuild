@@ -66,6 +66,11 @@ on:
         required: false
         default: "7"
         type: string
+      no_cache:
+        description: Measurement mode, start with every cache cold (target dir and sccache)
+        required: false
+        default: false
+        type: boolean
 
 env:
   RUSTC_WRAPPER: sccache
@@ -84,6 +89,20 @@ jobs:
           repository: ${{ inputs.repo }}
           ref: ${{ inputs.ref }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      # Layer 1: the target/ dir itself, keyed on repo+target+profile+lockfile,
+      # via the GitHub Actions cache. Unchanged deps then need no compile at
+      # all, and it keeps builds warm if R2 is down or unconfigured.
+      - name: Cache target dir
+        if: ${{ !inputs.no_cache }}
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ inputs.manifest_dir }}
+          shared-key: ${{ inputs.repo }}-${{ inputs.target }}-${{ inputs.profile }}
+          cache-on-failure: true
+          cache-all-crates: true
+      # Layer 2: sccache, shared R2 bucket when configured (below), else the
+      # Actions cache. Catches what the target cache misses: a changed lockfile
+      # still hits on every unchanged crate.
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
       - name: Compile cache backend
@@ -96,32 +115,31 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
           R2_BUCKET: ${{ vars.R2_BUCKET || 'sccache' }}
+          NO_CACHE: ${{ inputs.no_cache }}
         run: |
+          PREFIX="${{ inputs.repo }}/"
+          if [ "$NO_CACHE" = "true" ]; then
+            # Measurement runs write to a throwaway namespace so they neither
+            # benefit from nor pollute the shared cache.
+            PREFIX="_nocache/${GITHUB_RUN_ID}/"
+            echo "SCCACHE_GHA_VERSION=nocache-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
+            echo "measurement mode: all caches cold"
+          fi
           if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ACCOUNT_ID" ]; then
             {
               echo "SCCACHE_BUCKET=$R2_BUCKET"
               echo "SCCACHE_ENDPOINT=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
               echo "SCCACHE_REGION=auto"
               echo "SCCACHE_S3_USE_SSL=true"
-              echo "SCCACHE_S3_KEY_PREFIX=${{ inputs.repo }}/"
+              echo "SCCACHE_S3_KEY_PREFIX=$PREFIX"
               echo "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"
               echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY"
             } >> "$GITHUB_ENV"
-            echo "compile cache: R2 s3://$R2_BUCKET/${{ inputs.repo }}/"
+            echo "compile cache: R2 s3://$R2_BUCKET/$PREFIX"
           else
             echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
             echo "compile cache: GitHub Actions cache (set R2_* secrets/vars for the shared bucket)"
           fi
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-          key: ${{ runner.os }}-${{ inputs.repo }}-cargo-${{ hashFiles(format('{0}/Cargo.lock', inputs.manifest_dir)) }}
-          restore-keys: |
-            ${{ runner.os }}-${{ inputs.repo }}-cargo-
       - name: musl toolchain
         if: contains(inputs.target, 'musl')
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
