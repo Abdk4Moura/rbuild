@@ -59,7 +59,7 @@ remote() {
   # retry those a few times before giving up.
   # A codespace that is still ShuttingDown cannot be started; gh just times
   # out. Wait for it to settle first (common right after `down`).
-  local st; for _ in $(seq 1 24); do st="$(state)"; [ "$st" = "ShuttingDown" ] || break; sleep 5; done
+  ensure_up || return 1
   for try in 1 2 3 4 5 6; do
     out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'error connecting|context deadline exceeded|timed out while waiting|error getting ssh server'; then
@@ -71,6 +71,15 @@ remote() {
   return $rc
 }
 state() { gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown; }
+# Bring the codespace to Available before any ssh/rsync: a box that is still
+# ShuttingDown cannot be started (gh just times out), and starting explicitly
+# via the API is faster and more reliable than letting ssh trigger it.
+ensure_up() {
+  local st; for _ in $(seq 1 24); do st="$(state)"; [ "$st" = "ShuttingDown" ] || break; sleep 5; done
+  if [ "$(state)" = "Shutdown" ]; then gh api -X POST "/user/codespaces/$CS/start" >/dev/null 2>&1 || true; fi
+  for _ in $(seq 1 36); do [ "$(state)" = "Available" ] && return 0; sleep 5; done
+  echo "rbuild-cs: codespace did not reach Available (state $(state))" >&2; return 1
+}
 
 cmd_status() {
   gh codespace view -c "$CS"
@@ -180,6 +189,7 @@ cmd_fetch() {
 
 cmd_sync() {
   rb_need rsync
+  ensure_up || return 1
   local cfg host; cfg="$(mktemp)"; gh codespace ssh -c "$CS" --config > "$cfg"
   host="$(awk '/^Host /{print $2; exit}' "$cfg")"
   echo "rbuild-cs: rsync $ROOT/ -> $host:$CS_DIR/"
