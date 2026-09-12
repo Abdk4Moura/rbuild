@@ -69,7 +69,6 @@ on:
 
 env:
   RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   CARGO_INCREMENTAL: "0"
   CMAKE_C_COMPILER_LAUNCHER: sccache
   CMAKE_CXX_COMPILER_LAUNCHER: sccache
@@ -87,6 +86,32 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
       - name: Run sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Compile cache backend
+        # Shared R2 bucket when the secrets exist (warm across repos, machines
+        # and the Codespace), else the per-repo Actions cache. Selected in a
+        # step because `secrets` is not usable in a step-level `if`.
+        shell: bash
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET || 'sccache' }}
+        run: |
+          if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ACCOUNT_ID" ]; then
+            {
+              echo "SCCACHE_BUCKET=$R2_BUCKET"
+              echo "SCCACHE_ENDPOINT=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
+              echo "SCCACHE_REGION=auto"
+              echo "SCCACHE_S3_USE_SSL=true"
+              echo "SCCACHE_S3_KEY_PREFIX=${{ inputs.repo }}/"
+              echo "AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID"
+              echo "AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY"
+            } >> "$GITHUB_ENV"
+            echo "compile cache: R2 s3://$R2_BUCKET/${{ inputs.repo }}/"
+          else
+            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+            echo "compile cache: GitHub Actions cache (set R2_* secrets/vars for the shared bucket)"
+          fi
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:

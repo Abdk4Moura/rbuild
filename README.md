@@ -60,3 +60,49 @@ only costs one cold build since source lives in git.
 
 Private source repos: add a `SOURCE_TOKEN` repository secret here with
 `contents:read` on the source repo.
+
+## Shared compile cache (Cloudflare R2, free tier)
+
+With an R2 bucket, sccache objects are shared across Actions, the Codespace
+and any other machine, so even a cold runner is mostly cache hits. R2's free
+tier is 10 GB-month of storage per account, no egress fees. One-time setup:
+
+1. In the Cloudflare dashboard: R2 → Manage API tokens → create a token with
+   **Object Read & Write** (scope it to one bucket, name it `sccache`). Note
+   the Access Key ID, Secret Access Key, and your Account ID. R2 needs a
+   payment method on the account even inside the free tier; overage is about
+   $0.015 per GB-month.
+2. Hand them to the builder repo (never to the source repos):
+
+       gh secret set R2_ACCESS_KEY_ID     -R Abdk4Moura/rbuild
+       gh secret set R2_SECRET_ACCESS_KEY -R Abdk4Moura/rbuild
+       gh variable set R2_ACCOUNT_ID      -R Abdk4Moura/rbuild --body <account id>
+       gh variable set R2_BUCKET          -R Abdk4Moura/rbuild --body sccache   # optional
+
+3. Create the bucket and its lifecycle rule (idempotent):
+
+       gh workflow run cache-size.yml -R Abdk4Moura/rbuild -f mode=setup
+
+4. For the Codespace, the same three as Codespaces user secrets, visible to the
+   repo the Codespace belongs to (secrets are injected at start, so `rbuild cs
+   down` then `up` once):
+
+       gh secret set R2_ACCESS_KEY_ID     --user --app codespaces --repos Abdk4Moura/Egregoria
+       gh secret set R2_SECRET_ACCESS_KEY --user --app codespaces --repos Abdk4Moura/Egregoria
+       gh secret set R2_ACCOUNT_ID        --user --app codespaces --repos Abdk4Moura/Egregoria
+
+**Staying under 10 GB.** One bucket, one prefix per source repo
+(`<owner>/<repo>/`). Three controls, in order of importance:
+
+- A lifecycle rule expires every object 14 days after upload
+  (`R2_EXPIRE_DAYS` to change). sccache never evicts remote storage itself;
+  this is what does it. A hot object is simply re-uploaded on its next compile.
+- The weekly `cache-size` workflow measures the bucket, prints size per prefix
+  in the run summary, and if it is over `R2_MAX_GB` (default 8) deletes the
+  oldest objects until it is under 90% of the cap.
+- Without the R2 secrets everything falls back to the per-repo GitHub Actions
+  cache automatically, so a missing or revoked token degrades, never breaks.
+
+A full filament release build is roughly 1 to 2 GB of cache per target and
+profile. R2 free operations (1M writes, 10M reads a month) are not a
+constraint at hobby scale: a full build is a few thousand of each.

@@ -85,11 +85,12 @@ echo "rbuild: run https://github.com/$DISPATCH_REPO/actions/runs/$RUN_ID"
 
 set +e; gh run watch "$RUN_ID" -R "$DISPATCH_REPO" --exit-status --interval 5 >/dev/null; status=$?; set -e
 t1=$(date +%s)
-gh run view "$RUN_ID" -R "$DISPATCH_REPO" --json jobs,conclusion,createdAt --jq '
+# `gh run view --json jobs` returns null step timestamps; the REST job object has them.
+gh api "repos/$DISPATCH_REPO/actions/runs/$RUN_ID/jobs" --jq '
   .jobs[0] as $j |
-  "rbuild: \(.conclusion)  queue \(( ($j.startedAt|fromdateiso8601) - (.createdAt|fromdateiso8601) ))s  job \(( ($j.completedAt|fromdateiso8601) - ($j.startedAt|fromdateiso8601) ))s",
-  ($j.steps[] | select(.name == "Build" or .name == "Test" or .name == "Run sccache" or .name == "Cache cargo registry" or .name == "Toolchain")
-     | "rbuild:   \(.name): \(( (.completedAt|fromdateiso8601) - (.startedAt|fromdateiso8601) ))s")
+  "rbuild: \($j.conclusion)  queue \(( ($j.started_at|fromdateiso8601) - ($j.created_at|fromdateiso8601) ))s  job \(( ($j.completed_at|fromdateiso8601) - ($j.started_at|fromdateiso8601) ))s",
+  ($j.steps[] | select(.name == "Run actions/checkout@v4" or .name == "Run sccache" or .name == "Cache cargo registry" or .name == "Toolchain" or .name == "Build" or .name == "Test")
+     | "rbuild:   \(.name | sub("^Run "; "")): \(( (.completed_at|fromdateiso8601) - (.started_at|fromdateiso8601) ))s")
 ' 2>/dev/null || true
 echo "rbuild: wall $((t1 - t0))s dispatch to finish"
 

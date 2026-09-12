@@ -85,6 +85,17 @@ cmd_up() {
       rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal >/dev/null
       rustup override list 2>/dev/null | grep -q \"^$CS_DIR\" || rustup override set stable >/dev/null
     fi
+    # Shared R2 compile cache, if the codespace carries the R2_* user secrets.
+    if [ -n \"\${R2_ACCESS_KEY_ID:-}\" ] && [ -n \"\${R2_ACCOUNT_ID:-}\" ]; then
+      if ! command -v sccache >/dev/null 2>&1; then
+        echo 'rbuild-cs: installing sccache'
+        curl -sL https://github.com/mozilla/sccache/releases/download/v0.10.0/sccache-v0.10.0-x86_64-unknown-linux-musl.tar.gz \\
+          | tar -xz --strip-components=1 -C \"\$HOME/.cargo/bin\" --wildcards '*/sccache'
+      fi
+      echo 'rbuild-cs: compile cache: R2 (shared)'
+    else
+      echo 'rbuild-cs: compile cache: local only (set Codespaces user secrets R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID to share)'
+    fi
     echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h /workspaces | tail -1 | awk '{print \$4}') free\""
   echo "rbuild-cs: up in $(( $(date +%s) - t0 ))s"
 }
@@ -98,14 +109,25 @@ cmd_build() {
     cd '$CS_DIR' && git fetch -q origin '$REF' && git checkout -q --detach FETCH_HEAD
     echo \"rbuild-cs: at \$(git rev-parse --short HEAD)\"
     export FILAMENT_BUILD_SHA=\$(git rev-parse --short HEAD) FILAMENT_BUILD_DATE=\$(date -u +%F) RBUILD_SHA=\$(git rev-parse --short HEAD)
-    cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}"
+    if [ -n \"\${R2_ACCESS_KEY_ID:-}\" ] && command -v sccache >/dev/null 2>&1; then
+      export RUSTC_WRAPPER=sccache SCCACHE_BUCKET=\"\${R2_BUCKET:-sccache}\" SCCACHE_REGION=auto SCCACHE_S3_USE_SSL=true \\
+             SCCACHE_ENDPOINT=\"https://\$R2_ACCOUNT_ID.r2.cloudflarestorage.com\" SCCACHE_S3_KEY_PREFIX='$SRC_REPO/' \\
+             AWS_ACCESS_KEY_ID=\"\$R2_ACCESS_KEY_ID\" AWS_SECRET_ACCESS_KEY=\"\$R2_SECRET_ACCESS_KEY\" CARGO_INCREMENTAL=0
+      sccache --start-server >/dev/null 2>&1 || true
+    fi
+    cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}
+    command -v sccache >/dev/null 2>&1 && [ -n \"\${RUSTC_WRAPPER:-}\" ] && sccache --show-stats | grep -E 'hits|misses|Cache location' | head -4 || true"
   echo "rbuild-cs: build took $(( $(date +%s) - t0 ))s"
 }
 
 cmd_fetch() {
   mkdir -p "$OUT"
-  gh codespace cp -c "$CS" "remote:$CS_DIR/$MANIFEST_DIR/target/release/$BIN" "$OUT/$BIN"
-  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN"
+  # Ask cargo where target/ is: a CARGO_TARGET_DIR in the codespace's profile
+  # or a .cargo/config.toml relocates it, and guessing failed once already.
+  local td; td="$(remote "cd '$CS_DIR/$MANIFEST_DIR' && cargo metadata --no-deps --format-version 1 | jq -r .target_directory" | tail -1)"
+  [ -n "$td" ] || { echo "rbuild-cs: could not resolve target dir on the codespace" >&2; return 1; }
+  gh codespace cp -c "$CS" "remote:$td/release/$BIN" "$OUT/$BIN"
+  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN  (from $td/release/$BIN)"
 }
 
 cmd_sync() {

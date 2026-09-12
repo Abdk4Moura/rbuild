@@ -1,0 +1,94 @@
+# Keep the shared R2 sccache bucket inside the free tier.
+#
+# Weekly: measure the bucket, print per-prefix sizes, and if it exceeds
+# MAX_GB delete the oldest objects until it is under. A lifecycle rule
+# (objects expire N days after upload) does the everyday trimming; this is
+# the visible backstop. Run with mode=setup once to create the bucket and put
+# that lifecycle rule; it is idempotent.
+#
+# Needs secrets R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY (an R2 API token with
+# Object Read & Write on the bucket) and variable R2_ACCOUNT_ID; optional
+# variables R2_BUCKET (default sccache), R2_MAX_GB (default 8),
+# R2_EXPIRE_DAYS (default 14).
+
+name: cache-size
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: check (measure + prune) or setup (create bucket + lifecycle rule)
+        required: false
+        default: check
+        type: choice
+        options: [check, setup]
+
+jobs:
+  cache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: auto
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      ENDPOINT: https://${{ vars.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      BUCKET: ${{ vars.R2_BUCKET || 'sccache' }}
+      MAX_GB: ${{ vars.R2_MAX_GB || '8' }}
+      EXPIRE_DAYS: ${{ vars.R2_EXPIRE_DAYS || '14' }}
+    steps:
+      - name: Guard
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "${{ vars.R2_ACCOUNT_ID }}" ]; then
+            echo "::warning::R2 not configured (secrets R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY, var R2_ACCOUNT_ID); nothing to do"
+            echo "skip=1" >> "$GITHUB_ENV"
+          fi
+      - name: Setup bucket + lifecycle
+        if: env.skip != '1' && inputs.mode == 'setup'
+        run: |
+          set -euo pipefail
+          aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" 2>/dev/null \
+            || aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$BUCKET"
+          cat > lc.json <<JSON
+          {"Rules":[
+            {"ID":"expire-after-${EXPIRE_DAYS}d","Status":"Enabled","Filter":{"Prefix":""},
+             "Expiration":{"Days":${EXPIRE_DAYS}}},
+            {"ID":"abort-multipart","Status":"Enabled","Filter":{"Prefix":""},
+             "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}
+          ]}
+          JSON
+          aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration file://lc.json
+          aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration --bucket "$BUCKET"
+          echo "bucket $BUCKET ready; objects expire ${EXPIRE_DAYS} days after upload"
+      - name: Measure and prune
+        if: env.skip != '1'
+        run: |
+          set -euo pipefail
+          aws --endpoint-url "$ENDPOINT" s3api list-objects-v2 --bucket "$BUCKET" \
+            --query 'Contents[].{k:Key,s:Size,t:LastModified}' --output json > objs.json 2>/dev/null || echo '[]' > objs.json
+          [ "$(cat objs.json)" = "null" ] && echo '[]' > objs.json
+          total=$(jq '[.[].s] | add // 0' objs.json)
+          echo "## sccache bucket $BUCKET" >> "$GITHUB_STEP_SUMMARY"
+          echo "total: $(numfmt --to=iec "$total") in $(jq length objs.json) objects (cap ${MAX_GB} GB)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "by prefix:" | tee -a "$GITHUB_STEP_SUMMARY"
+          jq -r 'group_by(.k | split("/")[0]) | .[] | "\(.[0].k | split("/")[0])\t\([.[].s] | add)"' objs.json \
+            | while IFS=$'\t' read -r p b; do echo "  $p  $(numfmt --to=iec "$b")" | tee -a "$GITHUB_STEP_SUMMARY"; done
+          cap=$(( MAX_GB * 1024 * 1024 * 1024 ))
+          if [ "$total" -gt "$cap" ]; then
+            echo "::warning::bucket over ${MAX_GB} GB, pruning oldest objects"
+            # Oldest first; delete until under 90% of the cap.
+            jq -r --argjson cap "$cap" --argjson total "$total" '
+              sort_by(.t) | reduce .[] as $o ({acc:$total, del:[]};
+                if .acc > ($cap * 0.9) then {acc:(.acc - $o.s), del:(.del + [$o.k])} else . end) | .del[]' objs.json > del.txt
+            n=$(wc -l < del.txt); echo "deleting $n objects" | tee -a "$GITHUB_STEP_SUMMARY"
+            split -l 1000 del.txt chunk.
+            for c in chunk.*; do
+              jq -Rn '{Objects: [inputs | {Key: .}], Quiet: true}' "$c" > "$c.json"
+              aws --endpoint-url "$ENDPOINT" s3api delete-objects --bucket "$BUCKET" --delete "file://$c.json" >/dev/null
+            done
+          else
+            echo "under cap, nothing pruned" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
