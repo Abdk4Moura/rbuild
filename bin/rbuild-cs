@@ -54,8 +54,11 @@ remote() {
   # Right after a resume the codespace reports Available before its ssh
   # server answers ("context deadline exceeded", "timed out while waiting");
   # retry those a few times before giving up.
+  # A codespace that is still ShuttingDown cannot be started; gh just times
+  # out. Wait for it to settle first (common right after `down`).
+  local st; for _ in $(seq 1 24); do st="$(state)"; [ "$st" = "ShuttingDown" ] || break; sleep 5; done
   for try in 1 2 3 4 5 6; do
-    out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -s" 2>&1)"; rc=$?
+    out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'error connecting|context deadline exceeded|timed out while waiting|error getting ssh server'; then
       echo "rbuild-cs: codespace not answering yet (try $try/6), waiting 15s" >&2; sleep 15; continue
     fi
