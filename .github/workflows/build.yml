@@ -70,6 +70,11 @@ on:
         required: false
         default: false
         type: boolean
+      target_cache:
+        description: Restore/save the target dir via the Actions cache (layer 1)
+        required: false
+        default: true
+        type: boolean
 
 env:
   RUSTC_WRAPPER: sccache
@@ -92,7 +97,7 @@ jobs:
       # via the GitHub Actions cache. Unchanged deps then need no compile at
       # all, and it keeps builds warm if R2 is down or unconfigured.
       - name: Cache target dir
-        if: ${{ !inputs.no_cache }}
+        if: ${{ !inputs.no_cache && inputs.target_cache }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ${{ inputs.manifest_dir }}

@@ -13,6 +13,7 @@
 #   rbuild --profile measure           # any cargo profile the crate defines (filament: opt 1, no LTO)
 #   rbuild --target x86_64-unknown-linux-gnu -- --locked
 #   rbuild --no-cache                  # measurement: every cache cold, nothing shared
+#   rbuild --no-target-cache           # skip the target-dir layer (measures sccache/R2 alone)
 #   rbuild cs <verb> ...               # the reserve Codespace, see rbuild-cs
 #
 # Builds what is on GitHub, not your working tree: unpushed or dirty work on
@@ -25,7 +26,9 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 # shellcheck source=rbuild-lib.sh
 . "$HERE/rbuild-lib.sh"
 
-REF=""; PROFILE="release"; RUN_TESTS=false; RETENTION="7"; OUT=""; DOWNLOAD=true; FORCE=false; NO_CACHE=false
+main() {
+
+REF=""; PROFILE="release"; RUN_TESTS=false; RETENTION="7"; OUT=""; DOWNLOAD=true; FORCE=false; NO_CACHE=false; TARGET_CACHE=true
 T_FLAG=""; F_FLAG=""; EXTRA=()
 usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 while [ $# -gt 0 ]; do
@@ -40,6 +43,7 @@ while [ $# -gt 0 ]; do
     --no-download) DOWNLOAD=false; shift ;;
     --force) FORCE=true; shift ;;
     --no-cache) NO_CACHE=true; shift ;;
+    --no-target-cache) TARGET_CACHE=false; shift ;;
     -h|--help) usage 0 ;;
     --) shift; EXTRA=("$@"); break ;;
     *) echo "rbuild: unknown argument: $1" >&2; usage 2 ;;
@@ -73,7 +77,7 @@ echo "rbuild: $SRC_REPO@$REF  $MANIFEST_DIR/$BIN  $TARGET $PROFILE  (builder $DI
 gh workflow run build.yml -R "$DISPATCH_REPO" \
   -f "tag=$TAG" -f "repo=$SRC_REPO" -f "ref=$REF" -f "manifest_dir=$MANIFEST_DIR" -f "bin=$BIN" \
   -f "target=$TARGET" -f "profile=$PROFILE" -f "features=$FEATURES" -f "cargo_args=${EXTRA[*]:-}" \
-  -f "run_tests=$RUN_TESTS" -f "retention_days=$RETENTION" -f "no_cache=$NO_CACHE"
+  -f "run_tests=$RUN_TESTS" -f "retention_days=$RETENTION" -f "no_cache=$NO_CACHE" -f "target_cache=$TARGET_CACHE"
 
 RUN_ID=""
 for _ in $(seq 1 30); do
@@ -109,3 +113,6 @@ if [ "$DOWNLOAD" = true ]; then
   echo "rbuild: binary -> $OUT/$BIN"
   sed 's/^/rbuild:   /' "$OUT/BUILD_INFO"
 fi
+}
+
+main "$@"
