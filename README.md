@@ -67,11 +67,14 @@ With an R2 bucket, sccache objects are shared across Actions, the Codespace
 and any other machine, so even a cold runner is mostly cache hits. R2's free
 tier is 10 GB-month of storage per account, no egress fees. One-time setup:
 
-1. In the Cloudflare dashboard: R2 → Manage API tokens → create a token with
-   **Object Read & Write** (scope it to one bucket, name it `sccache`). Note
-   the Access Key ID, Secret Access Key, and your Account ID. R2 needs a
-   payment method on the account even inside the free tier; overage is about
-   $0.015 per GB-month.
+1. Get a token scoped to the bucket. Either run
+   `scripts/mint-r2-token.sh` (uses `~/secret_keys/cloudflare_api_token` to
+   mint a bucket-scoped account token, derives the S3 pair, stores it under
+   `~/secret_keys/r2_sccache_*`, and does steps 2 and 4 for you), or in the
+   Cloudflare dashboard: R2 → Manage API tokens → **Object Read & Write** on
+   the one bucket. Note the Access Key ID, Secret Access Key, and Account ID.
+   R2 needs a payment method on the account even inside the free tier;
+   overage is about $0.015 per GB-month.
 2. Hand them to the builder repo (never to the source repos):
 
        gh secret set R2_ACCESS_KEY_ID     -R Abdk4Moura/rbuild
@@ -100,8 +103,15 @@ tier is 10 GB-month of storage per account, no egress fees. One-time setup:
 - The weekly `cache-size` workflow measures the bucket, prints size per prefix
   in the run summary, and if it is over `R2_MAX_GB` (default 8) deletes the
   oldest objects until it is under 90% of the cap.
-- Without the R2 secrets everything falls back to the per-repo GitHub Actions
-  cache automatically, so a missing or revoked token degrades, never breaks.
+- Without working R2 secrets everything falls back to the per-repo GitHub
+  Actions cache automatically. The workflow probes the bucket with a
+  put-object first, because sccache aborts the build on a 401: a missing OR
+  revoked token degrades, never breaks (learned the hard way with a revoked
+  key).
+- Two cache layers, so either can be down: `rust-cache` keeps the `target/`
+  dir in the Actions cache (unchanged deps need no compile at all), and
+  sccache (R2, else Actions cache) catches the rest. `rbuild --no-cache` is
+  measurement mode: every layer cold, throwaway namespaces, nothing shared.
 
 A full filament release build is roughly 1 to 2 GB of cache per target and
 profile. R2 free operations (1M writes, 10M reads a month) are not a
