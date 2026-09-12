@@ -46,6 +46,22 @@ rb_load_config
 REPO_URL="https://github.com/$SRC_REPO.git"
 [ -n "$OUT" ] || OUT="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/${SRC_REPO/\//-}"
 
+# One ssh config per codespace, with connection multiplexing: the first
+# connection opens the gh tunnel (several seconds of handshake), later rsync
+# and command calls ride the same socket for ~10 minutes. This is what makes
+# an edit/dev iteration cost seconds instead of two handshakes.
+ssh_cfg() {
+  local cfg="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/cs-$CS.ssh"
+  if [ ! -s "$cfg" ] || [ -n "$(find "$cfg" -mmin +60 2>/dev/null)" ]; then
+    mkdir -p "$(dirname "$cfg")"
+    gh codespace ssh -c "$CS" --config > "$cfg.tmp" 2>/dev/null || { rm -f "$cfg.tmp"; return 1; }
+    printf '  ControlMaster auto\n  ControlPath %s/rbuild-cs-%%C\n  ControlPersist 10m\n  ServerAliveInterval 30\n  LogLevel ERROR\n' "${TMPDIR:-/tmp}" >> "$cfg.tmp"
+    mv "$cfg.tmp" "$cfg"
+  fi
+  printf '%s' "$cfg"
+}
+ssh_host() { awk '/^Host /{print $2; exit}' "$1"; }
+
 # Run a script on the codespace. gh starts a stopped codespace implicitly.
 # The script travels base64-encoded as ONE argument, so quoting and newlines
 # never reach the remote shell's argv (the naive multi-line `bash -lc "..."`
@@ -61,7 +77,12 @@ remote() {
   # out. Wait for it to settle first (common right after `down`).
   ensure_up || return 1
   for try in 1 2 3 4 5 6; do
-    out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
+    local cfg; cfg="$(ssh_cfg)" || cfg=""
+    if [ -n "$cfg" ]; then
+      out="$(ssh -F "$cfg" "$(ssh_host "$cfg")" "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
+    else
+      out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
+    fi
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'error connecting|context deadline exceeded|timed out while waiting|error getting ssh server'; then
       echo "rbuild-cs: codespace not answering yet (try $try/6), waiting 15s" >&2; sleep 15; continue
     fi
@@ -178,7 +199,7 @@ cmd_fetch() {
   # base64 keeps it tty-safe; sha256 on both ends proves the bytes arrived.
   local want got
   want="$(remote "sha256sum '$src' | cut -d' ' -f1" | tail -1)"
-  gh codespace ssh -c "$CS" -- "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.part"
+  local cfg; cfg="$(ssh_cfg)"; ssh -F "$cfg" "$(ssh_host "$cfg")" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.part"
   got="$(sha256sum "$OUT/$BIN.part" | cut -d' ' -f1)"
   if [ -z "$want" ] || [ "$want" != "$got" ]; then
     echo "rbuild-cs: checksum mismatch fetching $src (remote ${want:0:12} local ${got:0:12})" >&2; rm -f "$OUT/$BIN.part"; return 1
@@ -190,11 +211,11 @@ cmd_fetch() {
 cmd_sync() {
   rb_need rsync
   ensure_up || return 1
-  local cfg host; cfg="$(mktemp)"; gh codespace ssh -c "$CS" --config > "$cfg"
-  host="$(awk '/^Host /{print $2; exit}' "$cfg")"
-  echo "rbuild-cs: rsync $ROOT/ -> $host:$CS_DIR/"
-  rsync -az --delete -e "ssh -F $cfg" --exclude .git --exclude target --exclude node_modules "$ROOT/" "$host:$CS_DIR/"
-  rm -f "$cfg"
+  local cfg host ex=(); cfg="$(ssh_cfg)" || { echo "rbuild-cs: cannot get ssh config for $CS" >&2; return 1; }
+  host="$(ssh_host "$cfg")"
+  IFS=',' read -ra _ex <<< "$SYNC_EXCLUDE"; for e in "${_ex[@]}"; do e="$(echo "$e" | tr -d '[:space:]')"; [ -n "$e" ] && ex+=(--exclude "$e"); done
+  echo "rbuild-cs: rsync $ROOT/ -> $host:$CS_DIR/ ${SYNC_EXCLUDE:+(excluding $SYNC_EXCLUDE)}"
+  rsync -az --delete -e "ssh -F $cfg" --exclude .git --exclude target --exclude node_modules "${ex[@]}" "$ROOT/" "$host:$CS_DIR/"
 }
 
 # The inner loop: rsync the working tree over (uncommitted edits included),
@@ -213,7 +234,7 @@ cmd_dev() {
   echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
   if [ "$fetch" = true ] && [ "$mode" = build ]; then
     OUT="$OUT" EXTRA=() ; local src="$CS_DIR/$MANIFEST_DIR/target/debug/$BIN"
-    mkdir -p "$OUT"; gh codespace ssh -c "$CS" -- "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev"
+    mkdir -p "$OUT"; local cfg; cfg="$(ssh_cfg)"; ssh -F "$cfg" "$(ssh_host "$cfg")" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev"
   fi
 }
 
@@ -245,4 +266,6 @@ case "$VERB" in
 esac
 }
 
-main "$@"
+# exit here so bash never reads past this line: the file may have been
+# edited while this process ran, and stale bytes would parse as garbage.
+main "$@"; exit $?

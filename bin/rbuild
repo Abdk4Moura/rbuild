@@ -117,4 +117,6 @@ if [ "$DOWNLOAD" = true ]; then
 fi
 }
 
-main "$@"
+# exit here so bash never reads past this line: the file may have been
+# edited while this process ran, and stale bytes would parse as garbage.
+main "$@"; exit $?
