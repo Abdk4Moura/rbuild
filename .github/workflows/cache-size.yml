@@ -50,8 +50,13 @@ jobs:
         if: env.skip != '1' && inputs.mode == 'setup'
         run: |
           set -euo pipefail
-          aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" 2>/dev/null \
-            || aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$BUCKET"
+          # An "Object Read & Write" R2 token cannot create buckets or set
+          # lifecycle rules; those need Admin, or the Cloudflare API. Report
+          # instead of failing so the measure step still runs.
+          if ! aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$BUCKET" \
+              || { echo "::warning::cannot create bucket $BUCKET with this token; create it in the dashboard or via the Cloudflare API"; exit 0; }
+          fi
           cat > lc.json <<JSON
           {"Rules":[
             {"ID":"expire-after-${EXPIRE_DAYS}d","Status":"Enabled","Filter":{"Prefix":""},
@@ -60,9 +65,12 @@ jobs:
              "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}
           ]}
           JSON
-          aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration file://lc.json
-          aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration --bucket "$BUCKET"
-          echo "bucket $BUCKET ready; objects expire ${EXPIRE_DAYS} days after upload"
+          if aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration --bucket "$BUCKET" --lifecycle-configuration file://lc.json; then
+            aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration --bucket "$BUCKET"
+            echo "bucket $BUCKET ready; objects expire ${EXPIRE_DAYS} days after upload"
+          else
+            echo "::warning::token cannot set the lifecycle rule; set 'expire after ${EXPIRE_DAYS} days' in the dashboard (R2 > $BUCKET > Settings > Object lifecycle rules)"
+          fi
       - name: Measure and prune
         if: env.skip != '1'
         run: |
