@@ -49,8 +49,20 @@ REPO_URL="https://github.com/$SRC_REPO.git"
 # form trips "bash: -c: option requires an argument"). ~/.cargo/env is sourced
 # because the codespace login PATH does not include ~/.cargo/bin.
 remote() {
-  local b64; b64="$(printf '%s\n' '. "$HOME/.cargo/env" 2>/dev/null || true' "$1" | base64 -w0)"
-  gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -s" 2>&1 | grep -v '^#\+ *[0-9.]*%\|No default node version\|use .nvs link'
+  local b64 out rc try
+  b64="$(printf '%s\n' '. "$HOME/.cargo/env" 2>/dev/null || true' "$1" | base64 -w0)"
+  # Right after a resume the codespace reports Available before its ssh
+  # server answers ("context deadline exceeded", "timed out while waiting");
+  # retry those a few times before giving up.
+  for try in 1 2 3 4 5 6; do
+    out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -s" 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'error connecting|context deadline exceeded|timed out while waiting|error getting ssh server'; then
+      echo "rbuild-cs: codespace not answering yet (try $try/6), waiting 15s" >&2; sleep 15; continue
+    fi
+    break
+  done
+  printf '%s\n' "$out" | grep -v '^#\+ *[0-9.]*%\|No default node version\|use .nvs link\|^$'
+  return $rc
 }
 state() { gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown; }
 
@@ -116,6 +128,11 @@ cmd_build() {
       sccache --start-server >/dev/null 2>&1 || true
     fi
     cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}
+    # Record where cargo put the binary (a global build.target or target-dir
+    # relocates it); this no-op rebuild only checks freshness.
+    cargo build --release $FEATURES ${EXTRA[*]:-} --message-format=json-render-diagnostics 2>/dev/null \\
+      | jq -r 'select(.reason==\"compiler-artifact\" and .executable!=null) | .executable' | tail -1 > '$CS_DIR/.rbuild-last-bin'
+    echo \"rbuild-cs: binary at \$(cat '$CS_DIR/.rbuild-last-bin')\"
     command -v sccache >/dev/null 2>&1 && [ -n \"\${RUSTC_WRAPPER:-}\" ] && sccache --show-stats | grep -E 'hits|misses|Cache location' | head -4 || true"
   echo "rbuild-cs: build took $(( $(date +%s) - t0 ))s"
 }
@@ -124,10 +141,14 @@ cmd_fetch() {
   mkdir -p "$OUT"
   # Ask cargo where target/ is: a CARGO_TARGET_DIR in the codespace's profile
   # or a .cargo/config.toml relocates it, and guessing failed once already.
-  local td; td="$(remote "cd '$CS_DIR/$MANIFEST_DIR' && cargo metadata --no-deps --format-version 1 | jq -r .target_directory" | tail -1)"
-  [ -n "$td" ] || { echo "rbuild-cs: could not resolve target dir on the codespace" >&2; return 1; }
-  gh codespace cp -c "$CS" "remote:$td/release/$BIN" "$OUT/$BIN"
-  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN  (from $td/release/$BIN)"
+  local src; src="$(remote "
+    if [ -s '$CS_DIR/.rbuild-last-bin' ]; then cat '$CS_DIR/.rbuild-last-bin'; else
+      cd '$CS_DIR/$MANIFEST_DIR' && cargo build --release $FEATURES --message-format=json-render-diagnostics 2>/dev/null \\
+        | jq -r 'select(.reason==\"compiler-artifact\" and .executable!=null) | .executable' | tail -1
+    fi" | tail -1)"
+  [ -n "$src" ] || { echo "rbuild-cs: could not locate the built binary on the codespace (run 'rbuild cs build' first)" >&2; return 1; }
+  gh codespace cp -c "$CS" "remote:$src" "$OUT/$BIN"
+  chmod +x "$OUT/$BIN"; echo "rbuild-cs: binary -> $OUT/$BIN  (from $src)"
 }
 
 cmd_sync() {
