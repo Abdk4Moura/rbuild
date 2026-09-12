@@ -125,7 +125,20 @@ jobs:
             echo "SCCACHE_GHA_VERSION=nocache-${GITHUB_RUN_ID}" >> "$GITHUB_ENV"
             echo "measurement mode: all caches cold"
           fi
+          R2_OK=0
           if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ACCOUNT_ID" ]; then
+            # Probe before committing: sccache aborts the whole build on a 401,
+            # so a present-but-invalid token must degrade like a missing one.
+            if AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_DEFAULT_REGION=auto \
+               AWS_REQUEST_CHECKSUM_CALCULATION=when_required AWS_RESPONSE_CHECKSUM_VALIDATION=when_required \
+               timeout 20 aws --endpoint-url "https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com" s3api put-object \
+                 --bucket "$R2_BUCKET" --key "${PREFIX}.rbuild_probe" --body /dev/null >/dev/null 2>probe.err; then
+              R2_OK=1
+            else
+              echo "::warning::R2 credentials rejected ($(tr -d '\n' < probe.err | cut -c1-160)); falling back to the Actions cache"
+            fi
+          fi
+          if [ "$R2_OK" = 1 ]; then
             {
               echo "SCCACHE_BUCKET=$R2_BUCKET"
               echo "SCCACHE_ENDPOINT=https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com"
@@ -138,7 +151,7 @@ jobs:
             echo "compile cache: R2 s3://$R2_BUCKET/$PREFIX"
           else
             echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-            echo "compile cache: GitHub Actions cache (set R2_* secrets/vars for the shared bucket)"
+            echo "compile cache: GitHub Actions cache (R2 unset or rejected; see README for the shared bucket)"
           fi
       - name: musl toolchain
         if: contains(inputs.target, 'musl')

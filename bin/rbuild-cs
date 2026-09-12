@@ -125,7 +125,11 @@ cmd_build() {
       export RUSTC_WRAPPER=sccache SCCACHE_BUCKET=\"\${R2_BUCKET:-sccache}\" SCCACHE_REGION=auto SCCACHE_S3_USE_SSL=true \\
              SCCACHE_ENDPOINT=\"https://\$R2_ACCOUNT_ID.r2.cloudflarestorage.com\" SCCACHE_S3_KEY_PREFIX='$SRC_REPO/' \\
              AWS_ACCESS_KEY_ID=\"\$R2_ACCESS_KEY_ID\" AWS_SECRET_ACCESS_KEY=\"\$R2_SECRET_ACCESS_KEY\" CARGO_INCREMENTAL=0
-      sccache --start-server >/dev/null 2>&1 || true
+      # A rejected token must not take the build down with it.
+      if ! sccache --start-server >/tmp/sccache-start.log 2>&1; then
+        echo \"rbuild-cs: R2 cache unreachable (\$(grep -m1 -oE 'S3Error.{0,80}|error.{0,80}' /tmp/sccache-start.log | head -1)); building without a shared cache\"
+        unset RUSTC_WRAPPER
+      fi
     fi
     cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}
     # Record where cargo put the binary (a global build.target or target-dir
