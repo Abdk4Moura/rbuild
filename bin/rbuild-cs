@@ -14,6 +14,7 @@
 #   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
 #   rbuild cs sync                 # rsync the working tree over (uncommitted ok)
 #   rbuild cs dev [--check] [--fetch] [-- cargo args]   # THE LOOP: sync + incremental dev build/check, timed
+#   rbuild cs session 2h | status | end   # keep the box warm for a bounded time (heartbeat), then stop
 #   rbuild cs sh [cmd...]          # interactive shell, or one command
 #   rbuild cs clean                # remove target/ dirs on the codespace
 #   rbuild cs down                 # stop it (ALWAYS, when done)
@@ -70,6 +71,84 @@ fetch_file() {
   local src="$1" dst="$2" cfg host; cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
   if command -v rsync >/dev/null 2>&1 && rsync -az --inplace -e "ssh -F $cfg" "$host:$src" "$dst" 2>/dev/null; then return 0; fi
   ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"
+}
+
+LEASE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild"
+lease_file() { printf '%s/cs-%s.lease' "$LEASE_DIR" "$CS"; }
+lease_log()  { printf '%s/cs-%s.session.log' "$LEASE_DIR" "$CS"; }
+
+# Read the whole target dir into the page cache in the background, right
+# after a wake. 16 GB of RAM, ~5 GB of target: the first build after a resume
+# then behaves like any other (150 s -> ~10 s measured), and it runs while
+# you are still typing. Detached on the remote, so this returns at once.
+prewarm() {
+  remote "cd '$CS_DIR/$MANIFEST_DIR' 2>/dev/null || exit 0
+    [ -d target ] || exit 0
+    # The login profile leaves a dup of the ssh stderr pipe on a high fd
+    # (fd 6 seen), and any child that inherits it keeps sshd waiting until
+    # the child exits: redirecting 0-2 was not enough, the session hung for
+    # the whole cat. Close every fd above 2 before detaching.
+    for fd in \$(ls /proc/\$\$/fd); do [ \"\$fd\" -gt 2 ] && eval \"exec \$fd>&-\"; done
+    setsid nohup sh -c 'find target -type f -print0 2>/dev/null | xargs -0 cat >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
+    echo \"rbuild-cs: prewarming \$(du -sh target 2>/dev/null | cut -f1) of target/ into RAM (background)\""
+}
+
+# The session lease: keep the box awake for a bounded time so every dev
+# iteration inside it is warm, then stop it. The idle timeout (30 min, not
+# changeable on an existing codespace) counts connections as activity, so a
+# heartbeat over the multiplexed tunnel every few minutes holds it. If the
+# box stops anyway the holder says so in the log and wakes it again.
+session_holder() {  # runs detached: session_holder <end_epoch>
+  local end="$1" cfg host st
+  while [ "$(date +%s)" -lt "$end" ]; do
+    st="$(state)"
+    if [ "$st" != "Available" ] && [ "${BACKEND}" = codespace ]; then
+      echo "$(date -u +%FT%TZ) box is $st during lease; waking it" >> "$(lease_log)"
+      ensure_up >/dev/null 2>&1 && prewarm >/dev/null 2>&1
+    fi
+    cfg="$(ssh_cfg 2>/dev/null)" && host="$(ssh_host "$cfg")" && ssh -F "$cfg" -o ConnectTimeout=20 "$host" true >/dev/null 2>&1 \
+      && echo "$(date -u +%FT%TZ) heartbeat ok ($(( (end - $(date +%s)) / 60 )) min left)" >> "$(lease_log)" \
+      || echo "$(date -u +%FT%TZ) heartbeat FAILED (state $(state))" >> "$(lease_log)"
+    sleep 240
+  done
+  echo "$(date -u +%FT%TZ) lease ended, stopping" >> "$(lease_log)"
+  rm -f "$(lease_file)"
+  cmd_down >> "$(lease_log)" 2>&1
+}
+
+parse_duration() {  # 90m, 2h, 45 -> seconds
+  case "$1" in
+    *h) echo $(( ${1%h} * 3600 )) ;; *m) echo $(( ${1%m} * 60 )) ;; *s) echo "${1%s}" ;;
+    ''|*[!0-9]*) return 1 ;; *) echo $(( $1 * 60 )) ;;
+  esac
+}
+
+cmd_session() {
+  mkdir -p "$LEASE_DIR"
+  local sub="${EXTRA[0]:-}"
+  case "$sub" in
+    ''|status)
+      if [ -s "$(lease_file)" ]; then
+        read -r pid end < "$(lease_file)"
+        if kill -0 "$pid" 2>/dev/null; then
+          echo "rbuild-cs: lease active, $(( (end - $(date +%s)) / 60 )) min left (holder pid $pid, box $(state))"
+          tail -3 "$(lease_log)" 2>/dev/null | sed 's/^/  /'
+        else echo "rbuild-cs: stale lease file (holder gone); box $(state)"; rm -f "$(lease_file)"; fi
+      else echo "rbuild-cs: no lease; box $(state). Start one: rbuild cs session 2h"; fi ;;
+    end|stop)
+      if [ -s "$(lease_file)" ]; then read -r pid _ < "$(lease_file)"; kill "$pid" 2>/dev/null; rm -f "$(lease_file)"; echo "rbuild-cs: lease ended"; fi
+      cmd_down ;;
+    *)
+      local secs; secs="$(parse_duration "$sub")" || { echo "rbuild-cs: session <duration: 90m | 2h> | status | end" >&2; return 2; }
+      if [ -s "$(lease_file)" ]; then read -r pid _ < "$(lease_file)"; kill "$pid" 2>/dev/null; fi
+      EXTRA=(); cmd_up
+      local end=$(( $(date +%s) + secs ))
+      ( session_holder "$end" ) >/dev/null 2>&1 &
+      disown
+      echo "$! $end" > "$(lease_file)"
+      echo "$(date -u +%FT%TZ) lease started for $sub" >> "$(lease_log)"
+      echo "rbuild-cs: lease for $sub; the box stays warm until $(date -u -d "@$end" +%H:%M) UTC, then stops. 'rbuild cs session' shows status, 'rbuild cs session end' stops now." ;;
+  esac
 }
 
 # Run a script on the codespace. gh starts a stopped codespace implicitly.
@@ -163,6 +242,7 @@ cmd_up() {
     fi
     echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h /workspaces | tail -1 | awk '{print \$4}') free\""
   echo "rbuild-cs: up in $(( $(date +%s) - t0 ))s"
+  case " ${EXTRA[*]:-} " in *" --no-prewarm "*) ;; *) prewarm ;; esac
 }
 
 cmd_build() {
@@ -256,6 +336,8 @@ cmd_clean() {
 }
 
 cmd_down() {
+  if [ -s "$(lease_file)" ] && [ "${IN_HOLDER:-0}" = 0 ]; then read -r pid _ < "$(lease_file)"; kill "$pid" 2>/dev/null; rm -f "$(lease_file)"; echo "rbuild-cs: lease ended"; fi
+  if [ "$BACKEND" = ssh ]; then echo "rbuild-cs: $CS_SSH is a persistent host, nothing to stop"; return; fi
   if [ "$(state)" = "Shutdown" ]; then echo "rbuild-cs: already stopped"; return; fi
   gh codespace stop -c "$CS"; echo "rbuild-cs: stopped $CS"
 }
@@ -268,6 +350,7 @@ case "$VERB" in
   run)    trap 'cmd_down' EXIT; cmd_build; cmd_fetch ;;
   sync)   cmd_sync ;;
   dev)    cmd_dev ;;
+  session) cmd_session ;;
   sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"; else gh codespace ssh -c "$CS"; fi ;;
   clean)  cmd_clean ;;
   down)   cmd_down ;;
