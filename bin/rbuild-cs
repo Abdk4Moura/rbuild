@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rbuild-cs: the reserve Codespace for interactive Rust work.
+# rbuild-cs: the reserve Codespace (or a persistent ssh host) for interactive Rust work.
 #
 # Codespaces hours are metered, so the default build path is `rbuild` (free
 # Actions runner). This is for what Actions cannot do: a tight edit/compile
@@ -7,8 +7,8 @@
 # existing Codespace (never creates one), keeps the source repo cloned on its
 # disk so builds stay incremental, and always hands you a `down`.
 #
-#   rbuild cs status               # state, disk, toolchain, checkout
-#   rbuild cs up                   # start, clone/refresh, ensure stable toolchain
+#   rbuild cs status               # backend, state, disk, toolchain, checkout
+#   rbuild cs up [--no-prewarm]    # start, clone/refresh, ensure stable toolchain, warm the page cache
 #   rbuild cs build [--ref R] [-- cargo args]        # up + cargo build --release
 #   rbuild cs fetch [--out DIR]    # copy the binary back
 #   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
@@ -20,8 +20,14 @@
 #   rbuild cs down                 # stop it (ALWAYS, when done)
 #
 # CS and CS_DIR come from .rbuild or RBUILD_CS / RBUILD_CS_DIR. The idle
-# timeout (30 min) cannot be changed with gh; it is the safety net, `down` is
-# the rule.
+# timeout (30 min) cannot be changed on an existing codespace (the API
+# accepts idle_timeout_minutes and keeps 30); it is the safety net, `down`
+# is the rule, and `session` holds it with a heartbeat for a bounded time.
+#
+# Backends: CS_SSH=user@host (usually in ~/.config/rbuild/config, with
+# CS_SSH_PROXY / CS_SSH_KEY / CS_SSH_PORT) points every verb at a persistent
+# host over plain ssh, checkout in ~/rbuild/<repo>; `gh` is not used then.
+# RBUILD_BACKEND=codespace ignores CS_SSH for one invocation, =ssh forces it.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -31,7 +37,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 main() {
 
 REF=""; OUT=""; EXTRA=()
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 VERB="${1:-status}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -43,18 +49,28 @@ while [ $# -gt 0 ]; do
   esac
 done
 rb_load_config
-[ -n "$CS" ] || { echo "rbuild-cs: no codespace configured (CS= in .rbuild or RBUILD_CS)" >&2; exit 2; }
+[ -n "$CS" ] || { echo "rbuild-cs: no codespace configured (CS= in .rbuild or RBUILD_CS), and no CS_SSH host" >&2; exit 2; }
 REPO_URL="https://github.com/$SRC_REPO.git"
 [ -n "$OUT" ] || OUT="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/${SRC_REPO/\//-}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild"
 
 # One ssh config per codespace, with connection multiplexing: the first
 # connection opens the gh tunnel (several seconds of handshake), later rsync
 # and command calls ride the same socket for ~10 minutes. This is what makes
 # an edit/dev iteration cost seconds instead of two handshakes.
+# With BACKEND=ssh the same file describes the persistent host (CS_SSH,
+# CS_SSH_PROXY, CS_SSH_KEY, CS_SSH_PORT) and nothing below touches `gh`.
 ssh_cfg() {
-  local cfg="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild/cs-$CS.ssh"
-  if [ ! -s "$cfg" ] || [ -n "$(find "$cfg" -mmin +60 2>/dev/null)" ]; then
-    mkdir -p "$(dirname "$cfg")"
+  local cfg="$CACHE_DIR/cs-$CS.ssh"
+  mkdir -p "$CACHE_DIR"
+  if [ "$BACKEND" = ssh ]; then
+    {
+      printf 'Host rbuild-%s\n  HostName %s\n  User %s\n  Port %s\n  IdentityFile %s\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' \
+        "${CS#ssh-}" "${CS_SSH#*@}" "${CS_SSH%%@*}" "$CS_SSH_PORT" "$CS_SSH_KEY"
+      [ -n "$CS_SSH_PROXY" ] && printf '  ProxyCommand %s\n' "$CS_SSH_PROXY"
+      printf '  ControlMaster auto\n  ControlPath %s/rbuild-cs-%%C\n  ControlPersist 10m\n  ServerAliveInterval 30\n  LogLevel ERROR\n' "${TMPDIR:-/tmp}"
+    } > "$cfg.tmp"; mv "$cfg.tmp" "$cfg"
+  elif [ ! -s "$cfg" ] || [ -n "$(find "$cfg" -mmin +60 2>/dev/null)" ]; then
     gh codespace ssh -c "$CS" --config > "$cfg.tmp" 2>/dev/null || { rm -f "$cfg.tmp"; return 1; }
     printf '  ControlMaster auto\n  ControlPath %s/rbuild-cs-%%C\n  ControlPersist 10m\n  ServerAliveInterval 30\n  LogLevel ERROR\n' "${TMPDIR:-/tmp}" >> "$cfg.tmp"
     mv "$cfg.tmp" "$cfg"
@@ -62,6 +78,20 @@ ssh_cfg() {
   printf '%s' "$cfg"
 }
 ssh_host() { awk '/^Host /{print $2; exit}' "$1"; }
+
+# The ssh backend's default CS_DIR is ~/rbuild/<repo>; remote scripts quote
+# it, so resolve `~` to the remote $HOME once (cached next to the ssh config).
+resolve_cs_dir() {
+  [ "$BACKEND" = ssh ] || return 0
+  case "$CS_DIR" in '~'|'~/'*) ;; *) return 0 ;; esac
+  local f="$CACHE_DIR/cs-$CS.home" home cfg
+  if [ -s "$f" ]; then home="$(cat "$f")"; else
+    cfg="$(ssh_cfg)"; home="$(ssh -F "$cfg" "$(ssh_host "$cfg")" 'echo "$HOME"' 2>/dev/null | tail -1)"
+    [ -n "$home" ] || { echo "rbuild-cs: cannot reach $CS_SSH to resolve CS_DIR ($CS_DIR)" >&2; return 1; }
+    printf '%s' "$home" > "$f"
+  fi
+  CS_DIR="$home${CS_DIR#\~}"
+}
 
 # Copy one remote file here. rsync over the multiplexed tunnel compresses and
 # sends only changed blocks against the previous copy (a rebuilt binary is
@@ -73,14 +103,15 @@ fetch_file() {
   ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"
 }
 
-LEASE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild"
+LEASE_DIR="$CACHE_DIR"
 lease_file() { printf '%s/cs-%s.lease' "$LEASE_DIR" "$CS"; }
 lease_log()  { printf '%s/cs-%s.session.log' "$LEASE_DIR" "$CS"; }
 
 # Read the whole target dir into the page cache in the background, right
-# after a wake. 16 GB of RAM, ~5 GB of target: the first build after a resume
-# then behaves like any other (150 s -> ~10 s measured), and it runs while
-# you are still typing. Detached on the remote, so this returns at once.
+# after a wake. On the codespace (16 GB RAM, ~5 GB target) the first build
+# after a resume then behaves like any other (150 s -> ~10 s measured), and
+# it runs while you are still typing. Detached on the remote, so this
+# returns at once. `up --no-prewarm` skips it (a small-RAM host, say).
 prewarm() {
   remote "cd '$CS_DIR/$MANIFEST_DIR' 2>/dev/null || exit 0
     [ -d target ] || exit 0
@@ -167,47 +198,67 @@ remote() {
   ensure_up || return 1
   for try in 1 2 3 4 5 6; do
     local cfg; cfg="$(ssh_cfg)" || cfg=""
+    rc=0
     if [ -n "$cfg" ]; then
-      out="$(ssh -F "$cfg" "$(ssh_host "$cfg")" "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
+      out="$(ssh -F "$cfg" "$(ssh_host "$cfg")" "echo $b64 | base64 -d | bash -ls" 2>&1)" || rc=$?
+    elif [ "$BACKEND" = codespace ]; then
+      out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)" || rc=$?
     else
-      out="$(gh codespace ssh -c "$CS" -- "echo $b64 | base64 -d | bash -ls" 2>&1)"; rc=$?
+      echo "rbuild-cs: no ssh config for $CS_SSH" >&2; return 1
     fi
     if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qiE 'error connecting|context deadline exceeded|timed out while waiting|error getting ssh server'; then
       echo "rbuild-cs: codespace not answering yet (try $try/6), waiting 15s" >&2; sleep 15; continue
     fi
     break
   done
-  printf '%s\n' "$out" | grep -v '^#\+ *[0-9.]*%\|No default node version\|use .nvs link\|^$'
+  # `|| true`: an all-noise output makes grep exit 1, and under set -e that
+  # took the caller down (seen when prewarm had nothing to say on a fresh host).
+  printf '%s\n' "$out" | grep -v '^#\+ *[0-9.]*%\|No default node version\|use .nvs link\|^Now using node v\|^$' || true
   return $rc
 }
-state() { gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown; }
+state() {
+  [ "$BACKEND" = ssh ] && { echo Available; return; }
+  gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown
+}
 # Bring the codespace to Available before any ssh/rsync: a box that is still
 # ShuttingDown cannot be started (gh just times out), and starting explicitly
 # via the API is faster and more reliable than letting ssh trigger it.
 ensure_up() {
+  [ "$BACKEND" = ssh ] && return 0
   local st; for _ in $(seq 1 24); do st="$(state)"; [ "$st" = "ShuttingDown" ] || break; sleep 5; done
   if [ "$(state)" = "Shutdown" ]; then gh api -X POST "/user/codespaces/$CS/start" >/dev/null 2>&1 || true; fi
   for _ in $(seq 1 36); do [ "$(state)" = "Available" ] && return 0; sleep 5; done
   echo "rbuild-cs: codespace did not reach Available (state $(state))" >&2; return 1
 }
 
+# Where the checkouts live on the remote: /workspaces on a codespace, the
+# parent of CS_DIR over ssh. Status, clean and the free-space figure use it.
+work_root() { if [ "$BACKEND" = ssh ]; then printf '%s' "${CS_DIR%/*}"; else printf /workspaces; fi; }
+
 cmd_status() {
-  gh codespace view -c "$CS"
+  if [ "$BACKEND" = ssh ]; then
+    echo "backend: ssh  host: $CS_SSH${CS_SSH_PORT:+ port $CS_SSH_PORT}${CS_SSH_PROXY:+  via: $CS_SSH_PROXY}"
+    echo "key: $CS_SSH_KEY  dir: $CS_DIR"
+  else
+    echo "backend: codespace"; gh codespace view -c "$CS"
+  fi
   if [ "$(state)" = "Available" ]; then
     echo "--- remote"
     remote "
-      df -h /workspaces | tail -1 | awk '{print \"disk: \"\$3\" used / \"\$2\" (\"\$5\"), \"\$4\" free\"}'
-      for t in /workspaces/*/target /workspaces/*/*/target; do [ -d \"\$t\" ] && echo \"target: \$(du -sh \"\$t\" | cut -f1) \$t\"; done
+      mkdir -p '$(work_root)' 2>/dev/null; df -h '$(work_root)' | tail -1 | awk '{print \"disk: \"\$3\" used / \"\$2\" (\"\$5\"), \"\$4\" free\"}'
+      for t in '$(work_root)'/*/target '$(work_root)'/*/*/target; do [ -d \"\$t\" ] && echo \"target: \$(du -sh \"\$t\" | cut -f1) \$t\"; done
       if [ -d '$CS_DIR/.git' ]; then cd '$CS_DIR' && echo \"checkout: \$(git rev-parse --abbrev-ref HEAD) \$(git rev-parse --short HEAD)\"; else echo 'checkout: none'; fi
       command -v cargo >/dev/null && (cd '$CS_DIR' 2>/dev/null || cd /; echo \"cargo: \$(cargo --version)\") || echo 'cargo: MISSING'
-      echo \"cores: \$(nproc)\""
+      command -v mold >/dev/null && echo \"linker: mold\" || echo 'linker: default (no mold)'
+      echo \"cores: \$(nproc)  mem: \$(free -m | awk '/^Mem/{print \$7\" MB available of \"\$2}')\""
   else
     echo "(stopped: 'rbuild cs up' to start)"
   fi
 }
 
 cmd_up() {
-  echo "rbuild-cs: starting $CS (state: $(state))"; local t0; t0=$(date +%s)
+  if [ "$BACKEND" = ssh ]; then echo "rbuild-cs: preparing $CS_SSH:$CS_DIR"; else echo "rbuild-cs: starting $CS (state: $(state))"; fi
+  local t0; t0=$(date +%s)
   remote "
     set -e
     if ! command -v rustup >/dev/null 2>&1; then
@@ -215,11 +266,15 @@ cmd_up() {
       curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable >/dev/null
       . \"\$HOME/.cargo/env\"
     fi
-    if [ ! -d '$CS_DIR/.git' ]; then echo 'rbuild-cs: cloning $SRC_REPO'; git clone -q '$REPO_URL' '$CS_DIR'; fi
+    if [ ! -d '$CS_DIR/.git' ]; then echo 'rbuild-cs: cloning $SRC_REPO into $CS_DIR'; mkdir -p '$(work_root)'; git clone -q '$REPO_URL' '$CS_DIR'; fi
     cd '$CS_DIR' && git fetch -q origin
-    # Fast linker by default on the codespace (user-level config, the repo's
-    # own .cargo/config.toml is left alone). Relinking dominated the old loop.
-    if ! command -v mold >/dev/null 2>&1; then sudo apt-get install -y -q mold >/dev/null 2>&1 && echo 'rbuild-cs: installed mold'; fi
+    # Fast linker by default (user-level config, the repo's own
+    # .cargo/config.toml is left alone). Relinking dominated the old loop.
+    # Needs root to install; a host without passwordless sudo just skips it.
+    if ! command -v mold >/dev/null 2>&1; then
+      if sudo -n true 2>/dev/null; then sudo apt-get install -y -q mold >/dev/null 2>&1 && echo 'rbuild-cs: installed mold'
+      else echo 'rbuild-cs: mold: skipped (no passwordless sudo)'; fi
+    fi
     if command -v mold >/dev/null 2>&1 && ! grep -qs 'fuse-ld=mold' \"\$HOME/.cargo/config.toml\"; then
       mkdir -p \"\$HOME/.cargo\"; printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n' >> \"\$HOME/.cargo/config.toml\"
       echo 'rbuild-cs: mold set as linker in ~/.cargo/config.toml'
@@ -227,6 +282,12 @@ cmd_up() {
     # Stable unless the project pins its own toolchain.
     if [ ! -f rust-toolchain ] && [ ! -f rust-toolchain.toml ] && [ ! -f '$MANIFEST_DIR/rust-toolchain' ] && [ ! -f '$MANIFEST_DIR/rust-toolchain.toml' ]; then
       rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal >/dev/null
+      # A stable that predates the last ~4 months is a leftover install
+      # (popos had 1.77 from 2024); refresh it rather than fail on MSRV.
+      d=\$(rustc +stable --version 2>/dev/null | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || echo 1970-01-01)
+      if [ \$(( (\$(date +%s) - \$(date -d \"\$d\" +%s)) / 86400 )) -gt 120 ]; then
+        echo \"rbuild-cs: stable is from \$d, running rustup update stable\"; rustup update stable --no-self-update 2>&1 | grep -E 'installed|updated|unchanged' | head -1
+      fi
       rustup override list 2>/dev/null | grep -q \"^$CS_DIR\" || rustup override set stable >/dev/null
     fi
     # Shared R2 compile cache, if the codespace carries the R2_* user secrets.
@@ -238,9 +299,9 @@ cmd_up() {
       fi
       echo 'rbuild-cs: compile cache: R2 (shared)'
     else
-      echo 'rbuild-cs: compile cache: local only (set Codespaces user secrets R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID to share)'
+      echo 'rbuild-cs: compile cache: local only ($([ "$BACKEND" = ssh ] && echo "export R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID in the remote login profile" || echo "set Codespaces user secrets R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID") to share)'
     fi
-    echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h /workspaces | tail -1 | awk '{print \$4}') free\""
+    echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h '$(work_root)' | tail -1 | awk '{print \$4}') free\""
   echo "rbuild-cs: up in $(( $(date +%s) - t0 ))s"
   case " ${EXTRA[*]:-} " in *" --no-prewarm "*) ;; *) prewarm ;; esac
 }
@@ -330,9 +391,9 @@ cmd_dev() {
 
 cmd_clean() {
   remote "
-    for d in /workspaces/*/target /workspaces/*/*/target; do
+    for d in '$(work_root)'/*/target '$(work_root)'/*/*/target; do
       [ -d \"\$d\" ] && { echo \"rbuild-cs: removing \$(du -sh \"\$d\" | cut -f1) \$d\"; rm -rf \"\$d\"; }
-    done; df -h /workspaces | tail -1 | awk '{print \"rbuild-cs: \"\$4\" free\"}'"
+    done; df -h '$(work_root)' | tail -1 | awk '{print \"rbuild-cs: \"\$4\" free\"}'"
 }
 
 cmd_down() {
@@ -342,6 +403,7 @@ cmd_down() {
   gh codespace stop -c "$CS"; echo "rbuild-cs: stopped $CS"
 }
 
+case "$VERB" in down|-h|--help|help) ;; *) resolve_cs_dir || exit 1 ;; esac
 case "$VERB" in
   status) cmd_status ;;
   up)     cmd_up ;;
@@ -351,7 +413,9 @@ case "$VERB" in
   sync)   cmd_sync ;;
   dev)    cmd_dev ;;
   session) cmd_session ;;
-  sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"; else gh codespace ssh -c "$CS"; fi ;;
+  sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
+          elif [ "$BACKEND" = ssh ]; then cfg="$(ssh_cfg)" && ssh -F "$cfg" "$(ssh_host "$cfg")"
+          else ensure_up && gh codespace ssh -c "$CS"; fi ;;
   clean)  cmd_clean ;;
   down)   cmd_down ;;
   -h|--help|help) usage 0 ;;
