@@ -19,13 +19,15 @@
 #   CS_SSH_KEY    identity file for that host           (default ~/.ssh/rbuild_ed25519)
 #   CS_SSH_PORT   ssh port                              (default 22)
 #   SYNC_EXCLUDE  comma-separated paths `rbuild cs sync/dev` skip (besides .git, target, node_modules)
+#   CS_TARGET_DIR remote CARGO_TARGET_DIR; lets several checkouts (one CS_DIR per agent) share one
+#                 target dir on a small disk. cargo serializes concurrent builds on its lock.
 # BACKEND=codespace|ssh in a config file sets the default even when CS_SSH is set.
 # RBUILD_BACKEND=codespace ignores CS_SSH for one invocation (RBUILD_BACKEND=ssh
 # forces the other way). rb_load_config exports BACKEND as `ssh` or `codespace`.
 
 rb_need() { command -v "$1" >/dev/null 2>&1 || { echo "rbuild: missing $1" >&2; exit 2; }; }
 
-RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT SYNC_EXCLUDE BACKEND"
+RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT SYNC_EXCLUDE BACKEND CS_TARGET_DIR"
 
 rb_read_file() {  # rb_read_file <path>: assign every known KEY=VALUE line
   local k v
@@ -46,7 +48,7 @@ rb_load_config() {
   REPO_NAME="${SRC_REPO##*/}"
   MANIFEST_DIR="."; BIN="$REPO_NAME"; TARGET="x86_64-unknown-linux-musl"; FEATURES=""
   DISPATCH_REPO="Abdk4Moura/rbuild"; CS=""; CS_DIR=""; SYNC_EXCLUDE=""
-  CS_SSH=""; CS_SSH_PROXY=""; CS_SSH_KEY=""; CS_SSH_PORT=""; BACKEND=""
+  CS_SSH=""; CS_SSH_PROXY=""; CS_SSH_KEY=""; CS_SSH_PORT=""; BACKEND=""; CS_TARGET_DIR=""
   local user_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rbuild/config"
   [ -f "$user_cfg" ] && rb_read_file "$user_cfg"
   [ -f "$ROOT/.rbuild" ] && rb_read_file "$ROOT/.rbuild"

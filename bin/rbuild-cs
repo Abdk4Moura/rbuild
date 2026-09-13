@@ -113,7 +113,7 @@ lease_log()  { printf '%s/cs-%s.session.log' "$LEASE_DIR" "$CS"; }
 # it runs while you are still typing. Detached on the remote, so this
 # returns at once. `up --no-prewarm` skips it (a small-RAM host, say).
 prewarm() {
-  remote "cd '$CS_DIR/$MANIFEST_DIR' 2>/dev/null || exit 0
+  remote "${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' 2>/dev/null || exit 0
     [ -d target ] || exit 0
     # The login profile leaves a dup of the ssh stderr pipe on a high fd
     # (fd 6 seen), and any child that inherits it keeps sshd waiting until
@@ -325,7 +325,7 @@ cmd_build() {
         unset RUSTC_WRAPPER
       fi
     fi
-    cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}
+    ${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$MANIFEST_DIR' && cargo build --release $FEATURES ${EXTRA[*]:-}
     # Record where cargo put the binary (a global build.target or target-dir
     # relocates it); this no-op rebuild only checks freshness.
     cargo build --release $FEATURES ${EXTRA[*]:-} --message-format=json-render-diagnostics 2>/dev/null \\
@@ -341,7 +341,7 @@ cmd_fetch() {
   # or a .cargo/config.toml relocates it, and guessing failed once already.
   local src; src="$(remote "
     if [ -s '$CS_DIR/.rbuild-last-bin' ]; then cat '$CS_DIR/.rbuild-last-bin'; else
-      cd '$CS_DIR/$MANIFEST_DIR' && cargo build --release $FEATURES --message-format=json-render-diagnostics 2>/dev/null \\
+      ${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' && cargo build --release $FEATURES --message-format=json-render-diagnostics 2>/dev/null \\
         | jq -r 'select(.reason==\"compiler-artifact\" and .executable!=null) | .executable' | tail -1
     fi" | tail -1)"
   [ -n "$src" ] || { echo "rbuild-cs: could not locate the built binary on the codespace (run 'rbuild cs build' first)" >&2; return 1; }
@@ -388,7 +388,7 @@ cmd_dev() {
   EXTRA=(); cmd_sync
   local t1; t1=$(date +%s)
   remote "
-    cd '$CS_DIR/$MANIFEST_DIR' && s=\$SECONDS
+    ${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' && s=\$SECONDS
     cargo $mode --profile dev ${args[*]:-} 2>&1 | grep -vE '^\s*(Compiling|Checking|Downloaded|Downloading|Updating|Blocking)' | tail -40
     echo \"rbuild-cs: cargo $mode \$((SECONDS-s)) s\""
   echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
