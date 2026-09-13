@@ -19,12 +19,13 @@
 #   CS_SSH_KEY    identity file for that host           (default ~/.ssh/rbuild_ed25519)
 #   CS_SSH_PORT   ssh port                              (default 22)
 #   SYNC_EXCLUDE  comma-separated paths `rbuild cs sync/dev` skip (besides .git, target, node_modules)
+# BACKEND=codespace|ssh in a config file sets the default even when CS_SSH is set.
 # RBUILD_BACKEND=codespace ignores CS_SSH for one invocation (RBUILD_BACKEND=ssh
 # forces the other way). rb_load_config exports BACKEND as `ssh` or `codespace`.
 
 rb_need() { command -v "$1" >/dev/null 2>&1 || { echo "rbuild: missing $1" >&2; exit 2; }; }
 
-RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT SYNC_EXCLUDE"
+RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT SYNC_EXCLUDE BACKEND"
 
 rb_read_file() {  # rb_read_file <path>: assign every known KEY=VALUE line
   local k v
@@ -45,7 +46,7 @@ rb_load_config() {
   REPO_NAME="${SRC_REPO##*/}"
   MANIFEST_DIR="."; BIN="$REPO_NAME"; TARGET="x86_64-unknown-linux-musl"; FEATURES=""
   DISPATCH_REPO="Abdk4Moura/rbuild"; CS=""; CS_DIR=""; SYNC_EXCLUDE=""
-  CS_SSH=""; CS_SSH_PROXY=""; CS_SSH_KEY=""; CS_SSH_PORT=""
+  CS_SSH=""; CS_SSH_PROXY=""; CS_SSH_KEY=""; CS_SSH_PORT=""; BACKEND=""
   local user_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rbuild/config"
   [ -f "$user_cfg" ] && rb_read_file "$user_cfg"
   [ -f "$ROOT/.rbuild" ] && rb_read_file "$ROOT/.rbuild"
@@ -58,7 +59,13 @@ rb_load_config() {
   case "${RBUILD_BACKEND:-}" in
     codespace) BACKEND=codespace ;;
     ssh) BACKEND=ssh; [ -n "$CS_SSH" ] || { echo "rbuild: RBUILD_BACKEND=ssh but CS_SSH is not set" >&2; exit 2; } ;;
-    '') if [ -n "$CS_SSH" ]; then BACKEND=ssh; else BACKEND=codespace; fi ;;
+    '') # BACKEND=codespace|ssh from a config file picks the default explicitly;
+        # otherwise a configured CS_SSH host implies ssh.
+        case "$BACKEND" in
+          codespace|ssh) ;;
+          '') if [ -n "$CS_SSH" ]; then BACKEND=ssh; else BACKEND=codespace; fi ;;
+          *) echo "rbuild: BACKEND in config must be ssh or codespace (got $BACKEND)" >&2; exit 2 ;;
+        esac ;;
     *) echo "rbuild: RBUILD_BACKEND must be ssh or codespace" >&2; exit 2 ;;
   esac
   export BACKEND
