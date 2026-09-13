@@ -20,9 +20,12 @@ Two paths, one default and one reserve:
 Needs `gh` logged in with `repo`, `workflow` and (for `cs`) `codespace` scopes,
 plus `jq`. `gh auth refresh -s codespace` adds the last one.
 
-## Per-project config
+## Config
 
-A `.rbuild` file at the source repo root, `KEY=VALUE`:
+Three layers, each overriding the one before: `~/.config/rbuild/config`
+(user-level, machine defaults), `.rbuild` at the source repo root
+(per-project), then `RBUILD_<KEY>` environment variables. Flags override all
+three. Same `KEY=VALUE` format everywhere:
 
     MANIFEST_DIR=cli                          # where the Cargo.toml is (default .)
     BIN=filament                              # binary to collect (default: repo name)
@@ -30,8 +33,14 @@ A `.rbuild` file at the source repo root, `KEY=VALUE`:
     FEATURES=--features static                # passed verbatim
     CS=effective-spoon-pg59gwpxj6cxv5         # reserve codespace (rbuild cs)
     CS_DIR=/workspaces/filament               # checkout dir there
+    SYNC_EXCLUDE=docs,frontend                # paths `rbuild cs sync/dev` skip
+    CS_SSH=agboola@popos-guest                # persistent build host instead of the codespace
+    CS_SSH_PROXY=filament forward --stdio popos-guest:22   # optional ProxyCommand
+    CS_SSH_KEY=~/.ssh/rbuild_ed25519          # identity file (this is the default)
+    CS_SSH_PORT=22
 
-`RBUILD_<KEY>` env vars override the file; flags override both.
+The `CS_SSH*` keys normally belong in the user file: which box does your
+builds is a property of where you sit, not of the project.
 
 ## Use
 
@@ -60,6 +69,11 @@ Flags for measuring: `--no-cache` (every layer cold, throwaway namespaces),
     rbuild cs run --ref my-branch         # up, build, fetch, down
     rbuild cs up && rbuild cs sh          # interactive
     rbuild cs sync                        # rsync uncommitted tree over
+    rbuild cs dev                         # THE LOOP: sync + incremental dev build, timed
+    rbuild cs dev --check                 # cargo check instead
+    rbuild cs dev --fetch                 # and bring the debug binary back
+    rbuild cs session 2h                  # keep the box warm for 2 h, then stop it
+    rbuild cs session                     # lease status; `session end` stops now
     rbuild cs clean                       # free target/ dirs when the disk fills
     rbuild cs down                        # stop the meter
 
@@ -67,6 +81,76 @@ Rules for `cs`: one Codespace, never a second; `down` when done (the 30 min
 idle timeout is the safety net, not the plan); stopped disks still count
 against storage; 30 days idle deletes the Codespace and its caches, which
 only costs one cold build since source lives in git.
+
+### The edit/compile loop
+
+`rbuild cs dev` rsyncs the working tree (uncommitted edits included, minus
+`.git`, `target`, `node_modules` and `SYNC_EXCLUDE`) over one multiplexed ssh
+connection and runs an incremental `cargo build --profile dev` on the warm
+target dir, printing the seconds for each step. Measured on filament (4
+cores): a real edit plus incremental build round trip is 10 to 13 s (cargo
+5 to 7 s of that), a no-op iteration 7 s.
+
+**Prewarm.** The first build after a Codespace resume took ~150 s instead of
+~10 s because the page cache is cold: cargo's freshness check reads every
+file under `target/`. `rbuild cs up` now starts a detached
+`find target | xargs cat >/dev/null` on the box right after it comes up, so
+the ~5 GB are back in RAM while you are still typing (`up --no-prewarm` to
+skip). Small print: the login profile on the box leaves a dup of the ssh
+stderr pipe on a high fd, and a backgrounded child that inherits it keeps
+the ssh session open until it exits; the script closes every fd above 2
+before detaching, which is why this returns at once.
+
+**Session lease.** `rbuild cs session 2h` brings the box up, then leaves a
+detached holder process on your machine that opens a trivial ssh command
+every 4 minutes, logs each heartbeat to `~/.cache/rbuild/cs-<CS>.session.log`,
+wakes the box if it stopped anyway, and runs `down` when the lease ends (or
+on `rbuild cs session end`). The point: the 30 minute idle timeout counts
+connections as activity, so within a lease every `dev` iteration is warm
+and nothing you forget can burn more than the lease. The idle timeout itself
+is not changeable on an existing Codespace: `gh codespace edit` has no flag
+for it, and `PATCH /user/codespaces/<name>` with `idle_timeout_minutes`
+returns 200 and silently keeps 30. Lease state is `~/.cache/rbuild/cs-<CS>.lease`
+(`holder pid` and `end epoch`).
+
+### A persistent host instead of the Codespace (ssh backend)
+
+Set `CS_SSH=user@host` (normally in `~/.config/rbuild/config`):
+
+    # ~/.config/rbuild/config
+    CS_SSH=agboola@popos-guest
+    CS_SSH_PROXY=filament forward --stdio popos-guest:22
+
+and every `rbuild cs` verb targets that machine over plain ssh instead of the
+Codespace: same `remote`, `sync`, `dev`, `fetch`, `build`, `sh`, `clean`,
+`session`, same multiplexed connection, no `gh codespace` call anywhere.
+`CS_SSH_PROXY` is a ProxyCommand for hosts you reach through something
+(e.g. `filament forward --stdio popos-guest:22`), `CS_SSH_KEY` defaults to
+`~/.ssh/rbuild_ed25519`, `CS_SSH_PORT` to 22. The checkout lives in
+`~/rbuild/<repo>` on the host (a `CS_DIR` from a project `.rbuild` that
+points into `/workspaces/` is ignored there, that is the Codespace's mount).
+`rbuild cs up` on such a host installs rustup non-interactively if missing,
+clones the repo, pins `stable` unless the project has a `rust-toolchain`
+file, and installs mold only when `sudo -n true` works (otherwise it says
+`mold: skipped (no passwordless sudo)` and links with the default linker).
+`down` and the end of a session lease print that a persistent host has
+nothing to stop.
+
+The host's login shell must be silent for non-interactive sessions: rsync
+speaks its protocol over the same channel, and one line of profile chatter
+fails it with `protocol version mismatch -- is your shell clean?`. `rbuild cs
+sync` recognizes that message, says so, and shows the offending output; the
+fix is on the host (popos-guest had an unguarded `nvm use node` in
+`config.fish`, silenced with `>/dev/null`). Filament daemons, or anything
+else on the host, are not touched: rbuild only ever writes under
+`~/rbuild/<repo>`, `~/.cargo` and `~/.rustup` there.
+
+`RBUILD_BACKEND=codespace rbuild cs ...` ignores `CS_SSH` for one invocation,
+so the Codespace stays reachable from a box whose user config points at an
+ssh host; `RBUILD_BACKEND=ssh` forces the other way. `rbuild cs status`
+prints which backend is active. Cache, ssh config and lease files are per
+target (`~/.cache/rbuild/cs-<codespace>.*` and `cs-ssh-<host>.*`), so a
+lease on the Codespace and a loop on the ssh host do not interfere.
 
 Private source repos: add a `SOURCE_TOKEN` repository secret here with
 `contents:read` on the source repo.
