@@ -145,6 +145,16 @@ fix is on the host (popos-guest had an unguarded `nvm use node` in
 else on the host, are not touched: rbuild only ever writes under
 `~/rbuild/<repo>`, `~/.cargo` and `~/.rustup` there.
 
+Measured on popos-guest (Pop!_OS, 4 cores, 7.8 GB with ~3 GB free for us,
+no mold, reached through `filament forward`) on filament's dev profile:
+`up` with the toolchain refresh 76 s; the first full build `dev -j 3` 285 s
+(cargo 275 s, rsync 6 s); a no-op iteration 16 s (cargo 1 s, the rest rsync
+walking the tree); a real one-line edit 24 s (cargo 18 s, sync 3 s); the
+first `dev --check` after that edit 98 s, because check keeps its own
+metadata and starts cold. Peak system memory in use during the full build
+was 5.5 GB against a 4.8 GB baseline, so `-j 3` left headroom; on a 16 GB
+box drop the flag.
+
 `RBUILD_BACKEND=codespace rbuild cs ...` ignores `CS_SSH` for one invocation,
 so the Codespace stays reachable from a box whose user config points at an
 ssh host; `RBUILD_BACKEND=ssh` forces the other way. `rbuild cs status`
