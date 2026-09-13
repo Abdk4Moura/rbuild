@@ -365,8 +365,20 @@ cmd_sync() {
   local cfg host ex=(); cfg="$(ssh_cfg)" || { echo "rbuild-cs: cannot get ssh config for $CS" >&2; return 1; }
   host="$(ssh_host "$cfg")"
   IFS=',' read -ra _ex <<< "$SYNC_EXCLUDE"; for e in "${_ex[@]}"; do e="$(echo "$e" | tr -d '[:space:]')"; [ -n "$e" ] && ex+=(--exclude "$e"); done
+  # Ownership guard. rsync --delete makes the remote dir a mirror of ONE local
+  # tree; a second agent syncing its own tree into the same CS_DIR silently
+  # deletes the first agent's files (2026-09-13: a checkout without the exec
+  # branch overwrote the worker's). The dir remembers its source; a different
+  # source is refused unless RBUILD_TAKE_OVER=1.
+  local me="$(hostname):$ROOT" owner
+  owner="$(ssh -F "$cfg" "$host" "cat '$CS_DIR/.rbuild-source' 2>/dev/null" 2>/dev/null || true)"
+  if [ -n "$owner" ] && [ "$owner" != "$me" ] && [ "${RBUILD_TAKE_OVER:-0}" != 1 ]; then
+    echo "rbuild-cs: REFUSED: $CS_DIR on the box mirrors $owner, not $me." >&2
+    echo "           Use your own dir (RBUILD_CS_DIR=/workspaces/<repo>-<you>) or RBUILD_TAKE_OVER=1 to claim it." >&2
+    return 3
+  fi
   echo "rbuild-cs: rsync $ROOT/ -> $host:$CS_DIR/ ${SYNC_EXCLUDE:+(excluding $SYNC_EXCLUDE)}"
-  local err; err="$(rsync -az --delete -e "ssh -F $cfg" --exclude .git --exclude target --exclude node_modules "${ex[@]}" "$ROOT/" "$host:$CS_DIR/" 2>&1 >/dev/null)" || {
+  local err; err="$(rsync -az --delete -e "ssh -F $cfg" --exclude .git --exclude target --exclude node_modules --exclude .rbuild-source "${ex[@]}" "$ROOT/" "$host:$CS_DIR/" 2>&1 >/dev/null)" || {
     local rc=$?; printf '%s\n' "$err" >&2
     # rsync needs a silent non-interactive login shell on the remote; a
     # profile that prints (nvm's "Now using node ..." from a fish config,
@@ -376,6 +388,7 @@ cmd_sync() {
       ssh -F "$cfg" "$host" true 2>&1 | head -3 | sed 's/^/  | /' >&2
     fi
     return $rc; }
+  ssh -F "$cfg" "$host" "printf '%s' '$me' > '$CS_DIR/.rbuild-source'" 2>/dev/null || true
 }
 
 # The inner loop: rsync the working tree over (uncommitted edits included),
