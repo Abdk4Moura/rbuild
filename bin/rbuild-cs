@@ -98,9 +98,16 @@ resolve_cs_dir() {
 # mostly identical), so a 100 MB debug binary refreshes in seconds; base64
 # streaming is the fallback when rsync is missing on either side.
 fetch_file() {
-  local src="$1" dst="$2" cfg host; cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
-  if command -v rsync >/dev/null 2>&1 && rsync -az --inplace -e "ssh -F $cfg" "$host:$src" "$dst" 2>/dev/null; then return 0; fi
-  ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"
+  local src="$1" dst="$2" cfg host want got; cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
+  # Never a silent 0-byte file: check the remote file exists first, and
+  # compare sha256 after the copy (a broken transfer must fail loudly).
+  want="$(ssh -F "$cfg" "$host" "sha256sum '$src' 2>/dev/null | cut -d' ' -f1")"
+  [ -n "$want" ] || { echo "rbuild-cs: remote file not found: $src" >&2; return 1; }
+  if command -v rsync >/dev/null 2>&1; then rsync -az --inplace -e "ssh -F $cfg" "$host:$src" "$dst" 2>/dev/null \
+    || ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"
+  else ssh -F "$cfg" "$host" "base64 -w0 '$src'" 2>/dev/null | tr -d '\r\n' | base64 -d > "$dst"; fi
+  got="$(sha256sum "$dst" 2>/dev/null | cut -d' ' -f1)"
+  [ "$want" = "$got" ] || { echo "rbuild-cs: fetch of $src corrupt (remote ${want:0:12} local ${got:0:12})" >&2; rm -f "$dst"; return 1; }
 }
 
 LEASE_DIR="$CACHE_DIR"
@@ -414,7 +421,11 @@ cmd_dev() {
     echo \"rbuild-cs: cargo $mode \$((SECONDS-s)) s\""
   echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
   if [ "$fetch" = true ] && [ "$mode" = build ]; then
-    OUT="$OUT" EXTRA=() ; local src="$CS_DIR/$MANIFEST_DIR/target/debug/$BIN"
+    OUT="$OUT" EXTRA=()
+    # Ask cargo where the dev binary is: with CS_TARGET_DIR (shared target) it
+    # is not under CS_DIR, and guessing produced a silent 0-byte fetch once.
+    local src; src="$(remote "${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' && cargo build --profile dev ${args[*]:-} --message-format=json-render-diagnostics 2>/dev/null | jq -r 'select(.reason==\"compiler-artifact\" and .executable!=null) | .executable' | tail -1" | tail -1)"
+    [ -n "$src" ] || { echo "rbuild-cs: cargo did not report an executable to fetch" >&2; return 1; }
     mkdir -p "$OUT"; local t2; t2=$(date +%s); fetch_file "$src" "$OUT/$BIN.dev" && chmod +x "$OUT/$BIN.dev" && echo "rbuild-cs: dev binary -> $OUT/$BIN.dev ($(du -h "$OUT/$BIN.dev" | cut -f1), fetch $(( $(date +%s) - t2 )) s)"
   fi
 }
