@@ -76,12 +76,16 @@ rb_load_config() {
     # Default ~/rbuild/<repo>, resolved on the remote; a /workspaces/... path
     # is the codespace's mount (a project .rbuild written for it) and is
     # not carried over to a plain host.
-    case "$CS_DIR" in ''|/workspaces/*) CS_DIR="~/rbuild/$REPO_NAME" ;; esac
+    case "$CS_DIR" in ''|/workspaces/*) CS_DIR="~/rbuild/$(basename "$ROOT")" ;; esac
     # CS names the target for the cache, ssh config and lease files. Always
     # the sanitized host here: the project's CS is the codespace's name and
     # must keep its own files.
     CS="ssh-$(printf '%s' "${CS_SSH#*@}" | tr -c 'A-Za-z0-9._-' '_')"
   else
-    CS_DIR="${CS_DIR:-/workspaces/$REPO_NAME}"
+    # One remote checkout per LOCAL worktree, automatically: the remote dir is
+    # <parent>/<worktree basename>, so parallel worktrees (feature branches, several
+    # agents) never share a dir and never trip the sync ownership guard.
+    # RBUILD_CS_DIR still overrides; the project's CS_DIR only supplies the parent.
+    CS_DIR="$(dirname "${CS_DIR:-/workspaces/$REPO_NAME}")/$(basename "$ROOT")"
   fi
 }

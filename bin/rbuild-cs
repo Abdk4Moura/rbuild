@@ -120,15 +120,14 @@ lease_log()  { printf '%s/cs-%s.session.log' "$LEASE_DIR" "$CS"; }
 # it runs while you are still typing. Detached on the remote, so this
 # returns at once. `up --no-prewarm` skips it (a small-RAM host, say).
 prewarm() {
-  remote "${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' 2>/dev/null || exit 0
-    [ -d target ] || exit 0
+  remote "T='${CS_TARGET_DIR:-$CS_DIR/$MANIFEST_DIR/target}'; [ -d \"\$T\" ] || exit 0; cd \"\$T\"; ln -sfn \"\$T\" ./.self 2>/dev/null; T=.
     # The login profile leaves a dup of the ssh stderr pipe on a high fd
     # (fd 6 seen), and any child that inherits it keeps sshd waiting until
     # the child exits: redirecting 0-2 was not enough, the session hung for
     # the whole cat. Close every fd above 2 before detaching.
     for fd in \$(ls /proc/\$\$/fd); do [ \"\$fd\" -gt 2 ] && eval \"exec \$fd>&-\"; done
-    setsid nohup sh -c 'find target -type f -print0 2>/dev/null | xargs -0 cat >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
-    echo \"rbuild-cs: prewarming \$(du -sh target 2>/dev/null | cut -f1) of target/ into RAM (background)\""
+    setsid nohup sh -c 'find . -type f -print0 2>/dev/null | xargs -0 cat >/dev/null 2>&1' </dev/null >/dev/null 2>&1 &
+    echo \"rbuild-cs: prewarming \$(du -sh . 2>/dev/null | cut -f1) of \$(pwd) into RAM (background)\""
 }
 
 # The session lease: keep the box awake for a bounded time so every dev
@@ -285,6 +284,30 @@ cmd_up() {
     if command -v mold >/dev/null 2>&1 && ! grep -qs 'fuse-ld=mold' \"\$HOME/.cargo/config.toml\"; then
       mkdir -p \"\$HOME/.cargo\"; printf '\n[target.x86_64-unknown-linux-gnu]\nrustflags = [\"-C\", \"link-arg=-fuse-ld=mold\"]\n' >> \"\$HOME/.cargo/config.toml\"
       echo 'rbuild-cs: mold set as linker in ~/.cargo/config.toml'
+    fi
+    # Shared compile cache for EVERY cargo invocation on the box (rbuild or a
+    # bare cargo in \`rbuild cs sh\`): the same R2 bucket and prefix the Actions
+    # builds use, so all agents hit one cache. Probe first: sccache aborts a
+    # build when its backend is unreachable, so an unreachable R2 must leave
+    # rustc-wrapper unset rather than break builds.
+    if [ -n \"\${R2_ACCESS_KEY_ID:-}\" ] && [ -n \"\${R2_ACCOUNT_ID:-}\" ] && command -v sccache >/dev/null 2>&1; then
+      {
+        echo \"export SCCACHE_BUCKET='\${R2_BUCKET:-sccache}' SCCACHE_REGION=auto SCCACHE_S3_USE_SSL=true\"
+        echo \"export SCCACHE_ENDPOINT='https://\$R2_ACCOUNT_ID.r2.cloudflarestorage.com' SCCACHE_S3_KEY_PREFIX='$SRC_REPO/'\"
+        echo \"export AWS_ACCESS_KEY_ID='\$R2_ACCESS_KEY_ID' AWS_SECRET_ACCESS_KEY='\$R2_SECRET_ACCESS_KEY'\"
+      } > \"\$HOME/.rbuild-sccache.env\"; chmod 600 \"\$HOME/.rbuild-sccache.env\"
+      grep -qs 'rbuild-sccache.env' \"\$HOME/.bashrc\" || printf '\n[ -f ~/.rbuild-sccache.env ] && . ~/.rbuild-sccache.env\n' >> \"\$HOME/.bashrc\"
+      . \"\$HOME/.rbuild-sccache.env\"
+      sccache --stop-server >/dev/null 2>&1 || true
+      if sccache --start-server >/dev/null 2>&1; then
+        if ! grep -qs 'rustc-wrapper' \"\$HOME/.cargo/config.toml\"; then
+          printf '\n# rbuild: shared R2 sccache for every cargo run on this box\n[build]\nrustc-wrapper = \"%s\"\n' \"\$(command -v sccache)\" >> \"\$HOME/.cargo/config.toml\"
+        fi
+        echo 'rbuild-cs: compile cache: R2 (shared), wired for every cargo run on the box'
+      else
+        sed -i '/rustc-wrapper/d; /rbuild: shared R2 sccache/d' \"\$HOME/.cargo/config.toml\" 2>/dev/null
+        echo 'rbuild-cs: R2 unreachable; rustc-wrapper left unset (local compile only)'
+      fi
     fi
     # Smaller dev/test artifacts: full debuginfo made one crate tree 8 GB on
     # the 32 GB disk (test binaries 300 MB each). Line tables keep file:line
