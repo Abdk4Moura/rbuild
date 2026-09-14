@@ -11,7 +11,8 @@ Two paths, one default and one reserve:
 - **`rbuild cs`** manages one reserve Codespace for the things Actions cannot
   do: an edit/compile loop, debugging, a live binary. Metered (120 core-hours
   a month on Free), so it never creates a Codespace, reuses one you name, and
-  always gives you a `down`.
+  always gives you a `down`. The same verbs drive a machine of your own
+  instead, over ssh or over `filament exec`; see Backends.
 
 ## Install
 
@@ -38,6 +39,8 @@ three. Same `KEY=VALUE` format everywhere:
     CS_SSH_PROXY=filament forward --stdio popos-guest:22   # optional ProxyCommand
     CS_SSH_KEY=~/.ssh/rbuild_ed25519          # identity file (this is the default)
     CS_SSH_PORT=22
+    CS_EXEC=popos-guest                       # a filament peer as the build host, over filament exec
+    CS_EXEC_BIN=filament                      # which filament binary (this is the default)
 
 The `CS_SSH*` keys normally belong in the user file: which box does your
 builds is a property of where you sit, not of the project.
@@ -72,6 +75,7 @@ Flags for measuring: `--no-cache` (every layer cold, throwaway namespaces),
     rbuild cs dev                         # THE LOOP: sync + incremental dev build, timed
     rbuild cs dev --check                 # cargo check instead
     rbuild cs dev --fetch                 # and bring the debug binary back
+    rbuild cs watch --check               # the same on every save, one line per run
     rbuild cs session 2h                  # keep the box warm for 2 h, then stop it
     rbuild cs session                     # lease status; `session end` stops now
     rbuild cs clean                       # free target/ dirs when the disk fills
@@ -112,6 +116,54 @@ is not changeable on an existing Codespace: `gh codespace edit` has no flag
 for it, and `PATCH /user/codespaces/<name>` with `idle_timeout_minutes`
 returns 200 and silently keeps 30. Lease state is `~/.cache/rbuild/cs-<CS>.lease`
 (`holder pid` and `end epoch`).
+
+### The save-triggered loop (watch)
+
+`rbuild cs watch [--check] [-- cargo args]` is `dev` on a trigger: it waits
+for the working tree to change, debounces 300 ms so one burst of saves is one
+run, then syncs and runs the same incremental cargo step, printing one line
+per iteration.
+
+    rbuild-cs: watch /root/Projects/filament-dev (1 s poll, debounce 300 ms) -> effective-spoon-...: cargo check --profile dev
+    rbuild-cs: ctrl-c to stop
+    22:49:03  check ok  50.4s  (sync 2.9s)
+    22:49:24  check ok  7.4s  (sync 3.2s)
+
+A failure prints the same line with `FAILED` and the first error lines under
+it. Measured on filament against the Codespace (4 cores, warm target dir,
+`watch --check`): the first iteration 50.4 s because `cargo check` keeps its
+own metadata and starts cold, then a real one-line edit in `cli/src/l3.rs`
+7.4 s (rsync 3.2 s, cargo about 4 s) and the revert 7.2 s.
+
+What it watches is exactly what it would send: tracked files plus untracked
+non-ignored ones (`git ls-files -co --exclude-standard`), minus
+`SYNC_EXCLUDE`. `inotifywait` is used as the wake-up when inotify-tools is
+installed, otherwise the fallback is a 1 s poll; either way the decision to
+rebuild comes from comparing a signature of names and mtimes, so an event on
+an excluded path costs nothing (745 files in filament take 19 ms to
+signature). Iterations seconds apart keep the multiplexed ssh connection
+warm, and an idle watch pokes the transport every 4 minutes so the first save
+after a break is not a fresh handshake. Ctrl-C stops the loop and kills the
+in-flight remote command rather than leaving a cargo running on the box.
+
+### Backends
+
+`rbuild cs` drives one remote box over one of three transports. Everything
+above works the same on all three; only the transport and what the far side
+has to provide differ.
+
+| Backend | Config | The far side needs | Cost and caveats |
+| --- | --- | --- | --- |
+| `codespace` (default) | `CS=<codespace name>` | a GitHub Codespace you already created | metered Codespaces hours, so `down` when done; `gh` with the `codespace` scope; 4 cores, 16 GB, a 30 min idle timeout you cannot change |
+| `ssh` | `CS_SSH=user@host` (plus `CS_SSH_PROXY`, `CS_SSH_KEY`, `CS_SSH_PORT`) | sshd, a reachable port or a ProxyCommand, your key in `authorized_keys`, and a silent non-interactive login shell | free if you own the box; rsync delta transfers and a multiplexed connection, so iterations cost seconds |
+| `exec` | `CS_EXEC=<filament device>` (plus `CS_EXEC_BIN`) | `filament up` running and a `shell` grant for this device; no sshd, no open port, no key | free; one `filament exec` process per remote command instead of a shared mux, so each command pays its own link setup |
+
+Precedence, highest first: `RBUILD_BACKEND=codespace|ssh|exec` for one
+invocation, then a `BACKEND=` line in a config file, then `CS_EXEC` (picks
+`exec`), then `CS_SSH` (picks `ssh`), then the Codespace. `rbuild cs status`
+prints which one is active. Cache, ssh config and lease files are named per
+target (`cs-<codespace>.*`, `cs-ssh-<host>.*`, `cs-exec-<device>.*`), so a
+lease on one backend and a loop on another never share state.
 
 ### A persistent host instead of the Codespace (ssh backend)
 
@@ -161,6 +213,53 @@ ssh host; `RBUILD_BACKEND=ssh` forces the other way. `rbuild cs status`
 prints which backend is active. Cache, ssh config and lease files are per
 target (`~/.cache/rbuild/cs-<codespace>.*` and `cs-ssh-<host>.*`), so a
 lease on the Codespace and a loop on the ssh host do not interfere.
+
+### A filament peer instead of ssh (exec backend)
+
+Set `CS_EXEC=<device>` to the filament petname of a paired machine:
+
+    # ~/.config/rbuild/config
+    CS_EXEC=popos-guest
+
+Every remote command then goes through `filament exec <device> -- ...` over
+filament's own authenticated link, so the build host needs no sshd, no open
+port and no key in `authorized_keys`, only `filament up` and a `shell` grant
+for this device. The checkout lives in `~/rbuild/<worktree>` there, the same
+as the ssh backend; `CS_EXEC_BIN` points at a specific filament binary when
+the one on PATH is not the one you want.
+
+How each piece rides the transport:
+
+- Commands. The script still travels base64-encoded and still arrives as one
+  argument, which matters more here than over ssh: `filament exec` passes an
+  argument vector across exactly, so the whole script has to be a single
+  element (`filament exec DEV -- bash -lc "echo <b64> | base64 -d | bash -ls"`).
+  There is no waking to do, so `state` is always `Available`, `ensure_up`
+  returns at once and the codespace retry loop is skipped.
+- Sync. rsync needs a remote shell, and `filament exec` is usable as one
+  through a small wrapper the tool writes to
+  `~/.cache/rbuild/exec-rsh-<device>.sh`: rsync calls it as
+  `<rsh> [-l user] <host> <command...>`, the wrapper drops the host argument
+  (there is nothing to dial) and hands the rest to `filament exec` as argv.
+  rsync's protocol needs a clean stdout, which this transport keeps: filament
+  writes its progress to stderr, and `-q` silences that too. If the handshake
+  fails anyway the fallback is a tar pipe through exec's stdin with the same
+  excludes, which adds and overwrites but does not delete;
+  `RBUILD_EXEC_SYNC=rsync|tar` pins one of the two instead of trying rsync
+  first.
+- Fetch. `filament exec DEV -- cat <file>` streams the bytes, with the same
+  sha256 comparison on both ends that the ssh path uses, so a truncated
+  transfer fails loudly instead of leaving a short file.
+- `rbuild cs sh` opens `filament exec DEV --tty -- bash -l`, and a one-shot
+  `rbuild cs sh 'cmd'` goes through the same path as every other command.
+
+Status of the measurements: the transport was exercised end to end (status,
+`sh`, sync by rsync and by tar, fetch with the checksum check, and a watch
+loop) against a stand-in that implements the same argv contract, because
+`popos-guest`, the one filament peer set up as a build host, was offline for
+the whole session (`filament reach popos-guest` gave up at the presence
+phase). The numbers in the ssh section above remain the measured reference
+for a real remote box.
 
 Private source repos: add a `SOURCE_TOKEN` repository secret here with
 `contents:read` on the source repo.
