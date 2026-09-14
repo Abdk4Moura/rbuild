@@ -252,6 +252,14 @@ How each piece rides the transport:
   transfer fails loudly instead of leaving a short file.
 - `rbuild cs sh` opens `filament exec DEV --tty -- bash -l`, and a one-shot
   `rbuild cs sh 'cmd'` goes through the same path as every other command.
+  `--tty` is the one part of exec that a filament build may still refuse (the
+  pty is optional in the command); when it does, the message points at
+  `filament shell <device>`, which is the same PTY by another route.
+
+The backend refuses to start if `CS_EXEC_BIN` is missing or has no `exec`
+subcommand (filament 0.8.5 of 2026-08-31 and older answer `unknown command or
+device 'exec'`), so an old binary on PATH says so once instead of failing
+every verb in a different way.
 
 Status of the measurements: the transport was exercised end to end (status,
 `sh`, sync by rsync and by tar, fetch with the checksum check, and a watch

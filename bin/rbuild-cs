@@ -72,6 +72,16 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild"
 # filament's own progress lines off the channel.
 fexec() { "$CS_EXEC_BIN" exec "$CS_EXEC" -q --no-interactive -- "$@"; }
 
+# Say which of the two things is wrong before every command fails the same
+# vague way: no filament at all, or a filament that predates `exec` (0.8.5
+# from 2026-08-31 answers `unknown command or device 'exec'` and exits 2).
+exec_precheck() {
+  command -v "$CS_EXEC_BIN" >/dev/null 2>&1 \
+    || { echo "rbuild-cs: CS_EXEC_BIN '$CS_EXEC_BIN' not found on PATH" >&2; exit 2; }
+  "$CS_EXEC_BIN" exec --help >/dev/null 2>&1 \
+    || { echo "rbuild-cs: $CS_EXEC_BIN has no 'exec' subcommand; the exec backend needs a filament build that carries it (point CS_EXEC_BIN at one)" >&2; exit 2; }
+}
+
 # rsync's remote shell for the exec backend: rsync calls it as
 # `<rsh> [-l user] <host> <cmd> <args...>`, and there is no host to dial here,
 # so the wrapper drops the host and hands the rest to `filament exec` as argv.
@@ -700,7 +710,10 @@ cmd_down() {
   gh codespace stop -c "$CS"; echo "rbuild-cs: stopped $CS"
 }
 
-case "$VERB" in down|-h|--help|help) ;; *) resolve_cs_dir || exit 1 ;; esac
+case "$VERB" in
+  down|-h|--help|help) ;;
+  *) if [ "$BACKEND" = exec ]; then exec_precheck; fi; resolve_cs_dir || exit 1 ;;
+esac
 case "$VERB" in
   status) cmd_status ;;
   up)     cmd_up ;;
@@ -712,7 +725,12 @@ case "$VERB" in
   watch)  cmd_watch ;;
   session) cmd_session ;;
   sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
-          elif [ "$BACKEND" = exec ]; then "$CS_EXEC_BIN" exec "$CS_EXEC" --tty -- bash -l
+          elif [ "$BACKEND" = exec ]; then
+            # --tty is the interactive half of exec and is refused loudly by
+            # builds that have not implemented the pty yet; say what to run
+            # instead rather than leaving a bare error.
+            "$CS_EXEC_BIN" exec "$CS_EXEC" --tty -- bash -l \
+              || { echo "rbuild-cs: 'filament exec --tty' ended non-zero; if it was refused, this build has no pty in exec yet: use '$CS_EXEC_BIN shell $CS_EXEC'" >&2; exit 1; }
           elif [ "$BACKEND" = ssh ]; then cfg="$(ssh_cfg)" && ssh -F "$cfg" "$(ssh_host "$cfg")"
           else ensure_up && gh codespace ssh -c "$CS"; fi ;;
   clean)  cmd_clean ;;
