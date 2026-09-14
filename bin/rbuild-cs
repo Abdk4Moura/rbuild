@@ -298,8 +298,13 @@ cmd_up() {
       } > \"\$HOME/.rbuild-sccache.env\"; chmod 600 \"\$HOME/.rbuild-sccache.env\"
       grep -qs 'rbuild-sccache.env' \"\$HOME/.bashrc\" || printf '\n[ -f ~/.rbuild-sccache.env ] && . ~/.rbuild-sccache.env\n' >> \"\$HOME/.bashrc\"
       . \"\$HOME/.rbuild-sccache.env\"
+      # Start the sccache server DETACHED with every fd closed: it is a daemon,
+      # and a daemon that inherits the ssh session's fds keeps this remote()
+      # call open until it exits (the same fd-inheritance hang prewarm hit).
       sccache --stop-server >/dev/null 2>&1 || true
-      if sccache --start-server >/dev/null 2>&1; then
+      ( for fd in \$(ls /proc/\$\$/fd 2>/dev/null); do [ \"\$fd\" -gt 2 ] && eval \"exec \$fd>&-\"; done
+        setsid nohup sccache --start-server </dev/null >/dev/null 2>&1 & ) ; sleep 2
+      if sccache --show-stats 2>/dev/null | grep -q 'Cache location'; then
         if ! grep -qs 'rustc-wrapper' \"\$HOME/.cargo/config.toml\"; then
           printf '\n# rbuild: shared R2 sccache for every cargo run on this box\n[build]\nrustc-wrapper = \"%s\"\n' \"\$(command -v sccache)\" >> \"\$HOME/.cargo/config.toml\"
         fi
