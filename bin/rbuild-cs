@@ -735,7 +735,8 @@ case "$VERB" in
   dev)    cmd_dev ;;
   watch)  cmd_watch ;;
   session) cmd_session ;;
-  sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
+  sh)     echo "rbuild-cs: note: sh runs against the LAST SYNCED tree; run 'rbuild cs sync' or 'dev' first if you edited locally" >&2
+          if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
           elif [ "$BACKEND" = exec ]; then
             # --tty is the interactive half of exec and is refused loudly by
             # builds that have not implemented the pty yet; say what to run
