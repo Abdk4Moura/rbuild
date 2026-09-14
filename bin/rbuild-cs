@@ -14,6 +14,7 @@
 #   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
 #   rbuild cs sync                 # rsync the working tree over (uncommitted ok)
 #   rbuild cs dev [--check] [--fetch] [-- cargo args]   # THE LOOP: sync + incremental dev build/check, timed
+#   rbuild cs test [-- cargo test args]   # sync + cargo test in THIS worktree's remote dir (never a stale tree)
 #   rbuild cs watch [--check] [-- cargo args]        # the same, re-run on every save
 #   rbuild cs session 2h | status | end   # keep the box warm for a bounded time (heartbeat), then stop
 #   rbuild cs sh [cmd...]          # interactive shell, or one command
@@ -706,6 +707,20 @@ cmd_watch() {
   done
 }
 
+# Tests, done right: sync the working tree, then cargo test in THIS worktree's
+# remote dir with the shared target. Exists because `cs sh 'cd ... && cargo
+# test'` against a guessed path tested a stale tree more than once.
+cmd_test() {
+  local t0; t0=$(date +%s)
+  local args=("${EXTRA[@]}"); EXTRA=(); cmd_sync
+  local t1; t1=$(date +%s)
+  remote "
+    ${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' && s=\$SECONDS
+    cargo test --profile dev ${args[*]:-} 2>&1 | grep -vE '^\s*(Compiling|Checking|Downloaded|Downloading|Updating|Blocking)' | tail -60
+    echo \"rbuild-cs: cargo test \$((SECONDS-s)) s in $CS_DIR/$MANIFEST_DIR\""
+  echo "rbuild-cs: sync $((t1 - t0)) s, total $(( $(date +%s) - t0 )) s"
+}
+
 cmd_clean() {
   remote "
     for d in '$(work_root)'/*/target '$(work_root)'/*/*/target; do
@@ -733,9 +748,10 @@ case "$VERB" in
   run)    trap 'cmd_down' EXIT; cmd_build; cmd_fetch ;;
   sync)   cmd_sync ;;
   dev)    cmd_dev ;;
+  test)   cmd_test ;;
   watch)  cmd_watch ;;
   session) cmd_session ;;
-  sh)     echo "rbuild-cs: note: sh runs against the LAST SYNCED tree; run 'rbuild cs sync' or 'dev' first if you edited locally" >&2
+  sh)     echo "rbuild-cs: note: this worktree's remote dir is $CS_DIR (last synced tree; run 'rbuild cs sync'/'dev'/'test' to refresh)" >&2
           if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
           elif [ "$BACKEND" = exec ]; then
             # --tty is the interactive half of exec and is refused loudly by
