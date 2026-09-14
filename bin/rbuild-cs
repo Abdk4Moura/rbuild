@@ -254,7 +254,7 @@ cmd_session() {
 # because the codespace login PATH does not include ~/.cargo/bin.
 remote() {
   local b64 out rc try
-  b64="$(printf '%s\n' '. "$HOME/.cargo/env" 2>/dev/null || true' "$1" | base64 -w0)"
+  b64="$(printf '%s\n' '. "$HOME/.cargo/env" 2>/dev/null || true' '[ -f "$HOME/.rbuild-sccache.env" ] && . "$HOME/.rbuild-sccache.env"' "$1" | base64 -w0)"
   # Right after a resume the codespace reports Available before its ssh
   # server answers ("context deadline exceeded", "timed out while waiting");
   # retry those a few times before giving up.
@@ -368,7 +368,11 @@ cmd_up() {
         echo \"export SCCACHE_ENDPOINT='https://\$R2_ACCOUNT_ID.r2.cloudflarestorage.com' SCCACHE_S3_KEY_PREFIX='$SRC_REPO/'\"
         echo \"export AWS_ACCESS_KEY_ID='\$R2_ACCESS_KEY_ID' AWS_SECRET_ACCESS_KEY='\$R2_SECRET_ACCESS_KEY'\"
       } > \"\$HOME/.rbuild-sccache.env\"; chmod 600 \"\$HOME/.rbuild-sccache.env\"
-      grep -qs 'rbuild-sccache.env' \"\$HOME/.bashrc\" || printf '\n[ -f ~/.rbuild-sccache.env ] && . ~/.rbuild-sccache.env\n' >> \"\$HOME/.bashrc\"
+      # ~/.profile, not ~/.bashrc: the stock .bashrc returns early for
+      # non-interactive shells, and every remote cargo run is one (bash -ls).
+      for rc in \"\$HOME/.profile\" \"\$HOME/.bashrc\"; do
+        grep -qs 'rbuild-sccache.env' \"\$rc\" || printf '\n[ -f ~/.rbuild-sccache.env ] && . ~/.rbuild-sccache.env\n' >> \"\$rc\"
+      done
       . \"\$HOME/.rbuild-sccache.env\"
       # Start the sccache server DETACHED with every fd closed: it is a daemon,
       # and a daemon that inherits the ssh session's fds keeps this remote()
