@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# rbuild-cs: the reserve Codespace (or a persistent ssh host) for interactive Rust work.
+# rbuild-cs: the reserve Codespace (or a persistent ssh / filament-exec host) for interactive Rust work.
 #
 # Codespaces hours are metered, so the default build path is `rbuild` (free
 # Actions runner). This is for what Actions cannot do: a tight edit/compile
@@ -14,6 +14,7 @@
 #   rbuild cs run [--ref R] [--out DIR] [-- args]    # up + build + fetch + down
 #   rbuild cs sync                 # rsync the working tree over (uncommitted ok)
 #   rbuild cs dev [--check] [--fetch] [-- cargo args]   # THE LOOP: sync + incremental dev build/check, timed
+#   rbuild cs watch [--check] [-- cargo args]        # the same, re-run on every save
 #   rbuild cs session 2h | status | end   # keep the box warm for a bounded time (heartbeat), then stop
 #   rbuild cs sh [cmd...]          # interactive shell, or one command
 #   rbuild cs clean                # remove target/ dirs on the codespace
@@ -27,7 +28,11 @@
 # Backends: CS_SSH=user@host (usually in ~/.config/rbuild/config, with
 # CS_SSH_PROXY / CS_SSH_KEY / CS_SSH_PORT) points every verb at a persistent
 # host over plain ssh, checkout in ~/rbuild/<repo>; `gh` is not used then.
-# RBUILD_BACKEND=codespace ignores CS_SSH for one invocation, =ssh forces it.
+# CS_EXEC=<filament device> points them at a filament peer instead, over
+# `filament exec` (the peer needs no sshd, no port and no key, only a shell
+# grant for this device); CS_EXEC_BIN picks the filament binary. Precedence:
+# an explicit BACKEND / RBUILD_BACKEND wins, else CS_EXEC, else CS_SSH, else
+# the codespace. RBUILD_BACKEND=codespace ignores both for one invocation.
 
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -37,7 +42,7 @@ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 main() {
 
 REF=""; OUT=""; EXTRA=()
-usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 VERB="${1:-status}"; shift || true
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,7 +65,44 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/rbuild"
 # an edit/dev iteration cost seconds instead of two handshakes.
 # With BACKEND=ssh the same file describes the persistent host (CS_SSH,
 # CS_SSH_PROXY, CS_SSH_KEY, CS_SSH_PORT) and nothing below touches `gh`.
+# One command on the filament peer (BACKEND=exec). `filament exec` takes an
+# argument VECTOR and passes it across exactly, so a script must arrive as one
+# argv element; stdout and stderr stay separate and the remote exit code comes
+# back, which is what lets rsync and `cat` ride this transport. -q keeps
+# filament's own progress lines off the channel.
+fexec() { "$CS_EXEC_BIN" exec "$CS_EXEC" -q --no-interactive -- "$@"; }
+
+# rsync's remote shell for the exec backend: rsync calls it as
+# `<rsh> [-l user] <host> <cmd> <args...>`, and there is no host to dial here,
+# so the wrapper drops the host and hands the rest to `filament exec` as argv.
+exec_rsh() {
+  local w="$CACHE_DIR/exec-rsh-$(printf '%s' "$CS_EXEC" | tr -c 'A-Za-z0-9._-' '_').sh"
+  mkdir -p "$CACHE_DIR"
+  {
+    echo '#!/bin/sh'
+    echo '# written by rbuild-cs: rsync -e wrapper for the filament exec backend'
+    echo 'while [ $# -gt 0 ]; do'
+    echo '  case "$1" in'
+    echo '    -l) shift 2 ;;'
+    echo '    -*) shift ;;'
+    echo '    *)  shift; break ;;'
+    echo '  esac'
+    echo 'done'
+    printf 'exec %q exec %q -q --no-interactive -- "$@"\n' "$CS_EXEC_BIN" "$CS_EXEC"
+  } > "$w.tmp"
+  chmod +x "$w.tmp"; mv "$w.tmp" "$w"; printf '%s' "$w"
+}
+
+# A cheap liveness poke over whichever transport is configured (the session
+# heartbeat, and the idle keepalive in `watch`).
+transport_ping() {
+  if [ "$BACKEND" = exec ]; then fexec true >/dev/null 2>&1; return $?; fi
+  local cfg host; cfg="$(ssh_cfg 2>/dev/null)" || return 1; host="$(ssh_host "$cfg")"
+  ssh -F "$cfg" -o ConnectTimeout=20 "$host" true >/dev/null 2>&1
+}
+
 ssh_cfg() {
+  [ "$BACKEND" = exec ] && return 1
   local cfg="$CACHE_DIR/cs-$CS.ssh"
   mkdir -p "$CACHE_DIR"
   if [ "$BACKEND" = ssh ]; then
@@ -82,10 +124,16 @@ ssh_host() { awk '/^Host /{print $2; exit}' "$1"; }
 # The ssh backend's default CS_DIR is ~/rbuild/<repo>; remote scripts quote
 # it, so resolve `~` to the remote $HOME once (cached next to the ssh config).
 resolve_cs_dir() {
-  [ "$BACKEND" = ssh ] || return 0
+  case "$BACKEND" in ssh|exec) ;; *) return 0 ;; esac
   case "$CS_DIR" in '~'|'~/'*) ;; *) return 0 ;; esac
   local f="$CACHE_DIR/cs-$CS.home" home cfg
-  if [ -s "$f" ]; then home="$(cat "$f")"; else
+  if [ -s "$f" ]; then home="$(cat "$f")"
+  elif [ "$BACKEND" = exec ]; then
+    mkdir -p "$CACHE_DIR"
+    home="$(fexec bash -lc 'echo "$HOME"' 2>/dev/null | tr -d '\r' | tail -1)"
+    [ -n "$home" ] || { echo "rbuild-cs: cannot reach $CS_EXEC over filament exec to resolve CS_DIR ($CS_DIR)" >&2; return 1; }
+    printf '%s' "$home" > "$f"
+  else
     cfg="$(ssh_cfg)"; home="$(ssh -F "$cfg" "$(ssh_host "$cfg")" 'echo "$HOME"' 2>/dev/null | tail -1)"
     [ -n "$home" ] || { echo "rbuild-cs: cannot reach $CS_SSH to resolve CS_DIR ($CS_DIR)" >&2; return 1; }
     printf '%s' "$home" > "$f"
@@ -98,7 +146,18 @@ resolve_cs_dir() {
 # mostly identical), so a 100 MB debug binary refreshes in seconds; base64
 # streaming is the fallback when rsync is missing on either side.
 fetch_file() {
-  local src="$1" dst="$2" cfg host want got; cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
+  local src="$1" dst="$2" cfg host want got
+  if [ "$BACKEND" = exec ]; then
+    # No rsync delta here: `filament exec DEV -- cat FILE` streams the bytes on
+    # a clean stdout, and the same sha256 check proves they all arrived.
+    want="$(fexec sha256sum "$src" 2>/dev/null | tr -d '\r' | cut -d' ' -f1)"
+    [ -n "$want" ] || { echo "rbuild-cs: remote file not found: $src" >&2; return 1; }
+    fexec cat "$src" > "$dst" || { echo "rbuild-cs: filament exec cat failed for $src" >&2; rm -f "$dst"; return 1; }
+    got="$(sha256sum "$dst" 2>/dev/null | cut -d' ' -f1)"
+    [ "$want" = "$got" ] || { echo "rbuild-cs: fetch of $src corrupt (remote ${want:0:12} local ${got:0:12})" >&2; rm -f "$dst"; return 1; }
+    return 0
+  fi
+  cfg="$(ssh_cfg)" || return 1; host="$(ssh_host "$cfg")"
   # Never a silent 0-byte file: check the remote file exists first, and
   # compare sha256 after the copy (a broken transfer must fail loudly).
   want="$(ssh -F "$cfg" "$host" "sha256sum '$src' 2>/dev/null | cut -d' ' -f1")"
@@ -136,14 +195,14 @@ prewarm() {
 # heartbeat over the multiplexed tunnel every few minutes holds it. If the
 # box stops anyway the holder says so in the log and wakes it again.
 session_holder() {  # runs detached: session_holder <end_epoch>
-  local end="$1" cfg host st
+  local end="$1" st
   while [ "$(date +%s)" -lt "$end" ]; do
     st="$(state)"
     if [ "$st" != "Available" ] && [ "${BACKEND}" = codespace ]; then
       echo "$(date -u +%FT%TZ) box is $st during lease; waking it" >> "$(lease_log)"
       ensure_up >/dev/null 2>&1 && prewarm >/dev/null 2>&1
     fi
-    cfg="$(ssh_cfg 2>/dev/null)" && host="$(ssh_host "$cfg")" && ssh -F "$cfg" -o ConnectTimeout=20 "$host" true >/dev/null 2>&1 \
+    transport_ping \
       && echo "$(date -u +%FT%TZ) heartbeat ok ($(( (end - $(date +%s)) / 60 )) min left)" >> "$(lease_log)" \
       || echo "$(date -u +%FT%TZ) heartbeat FAILED (state $(state))" >> "$(lease_log)"
     sleep 240
@@ -203,8 +262,14 @@ remote() {
   # out. Wait for it to settle first (common right after `down`).
   ensure_up || return 1
   for try in 1 2 3 4 5 6; do
-    local cfg; cfg="$(ssh_cfg)" || cfg=""
     rc=0
+    # The exec backend has no "still starting" state to retry around: one
+    # attempt, and the script crosses as ONE argv element after `bash -lc`.
+    if [ "$BACKEND" = exec ]; then
+      out="$(fexec bash -lc "echo $b64 | base64 -d | bash -ls" 2>&1)" || rc=$?
+      break
+    fi
+    local cfg; cfg="$(ssh_cfg)" || cfg=""
     if [ -n "$cfg" ]; then
       out="$(ssh -F "$cfg" "$(ssh_host "$cfg")" "echo $b64 | base64 -d | bash -ls" 2>&1)" || rc=$?
     elif [ "$BACKEND" = codespace ]; then
@@ -223,14 +288,14 @@ remote() {
   return $rc
 }
 state() {
-  [ "$BACKEND" = ssh ] && { echo Available; return; }
+  case "$BACKEND" in ssh|exec) echo Available; return ;; esac
   gh codespace view -c "$CS" --json state --jq .state 2>/dev/null || echo unknown
 }
 # Bring the codespace to Available before any ssh/rsync: a box that is still
 # ShuttingDown cannot be started (gh just times out), and starting explicitly
 # via the API is faster and more reliable than letting ssh trigger it.
 ensure_up() {
-  [ "$BACKEND" = ssh ] && return 0
+  case "$BACKEND" in ssh|exec) return 0 ;; esac
   local st; for _ in $(seq 1 24); do st="$(state)"; [ "$st" = "ShuttingDown" ] || break; sleep 5; done
   if [ "$(state)" = "Shutdown" ]; then gh api -X POST "/user/codespaces/$CS/start" >/dev/null 2>&1 || true; fi
   for _ in $(seq 1 36); do [ "$(state)" = "Available" ] && return 0; sleep 5; done
@@ -239,10 +304,13 @@ ensure_up() {
 
 # Where the checkouts live on the remote: /workspaces on a codespace, the
 # parent of CS_DIR over ssh. Status, clean and the free-space figure use it.
-work_root() { if [ "$BACKEND" = ssh ]; then printf '%s' "${CS_DIR%/*}"; else printf /workspaces; fi; }
+work_root() { if [ "$BACKEND" = codespace ]; then printf /workspaces; else printf '%s' "${CS_DIR%/*}"; fi; }
 
 cmd_status() {
-  if [ "$BACKEND" = ssh ]; then
+  if [ "$BACKEND" = exec ]; then
+    echo "backend: exec  device: $CS_EXEC  via: $CS_EXEC_BIN exec"
+    echo "dir: $CS_DIR"
+  elif [ "$BACKEND" = ssh ]; then
     echo "backend: ssh  host: $CS_SSH${CS_SSH_PORT:+ port $CS_SSH_PORT}${CS_SSH_PROXY:+  via: $CS_SSH_PROXY}"
     echo "key: $CS_SSH_KEY  dir: $CS_DIR"
   else
@@ -263,7 +331,11 @@ cmd_status() {
 }
 
 cmd_up() {
-  if [ "$BACKEND" = ssh ]; then echo "rbuild-cs: preparing $CS_SSH:$CS_DIR"; else echo "rbuild-cs: starting $CS (state: $(state))"; fi
+  case "$BACKEND" in
+    exec) echo "rbuild-cs: preparing $CS_EXEC:$CS_DIR (over filament exec)" ;;
+    ssh)  echo "rbuild-cs: preparing $CS_SSH:$CS_DIR" ;;
+    *)    echo "rbuild-cs: starting $CS (state: $(state))" ;;
+  esac
   local t0; t0=$(date +%s)
   remote "
     set -e
@@ -342,7 +414,7 @@ cmd_up() {
       fi
       echo 'rbuild-cs: compile cache: R2 (shared)'
     else
-      echo 'rbuild-cs: compile cache: local only ($([ "$BACKEND" = ssh ] && echo "export R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID in the remote login profile" || echo "set Codespaces user secrets R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID") to share)'
+      echo 'rbuild-cs: compile cache: local only ($([ "$BACKEND" != codespace ] && echo "export R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID in the remote login profile" || echo "set Codespaces user secrets R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ACCOUNT_ID") to share)'
     fi
     echo \"rbuild-cs: ready  \$(cargo --version)  \$(nproc) cores  \$(df -h '$(work_root)' | tail -1 | awk '{print \$4}') free\""
   echo "rbuild-cs: up in $(( $(date +%s) - t0 ))s"
@@ -402,9 +474,46 @@ cmd_fetch() {
   echo "rbuild-cs: binary -> $OUT/$BIN  (from $src, sha256 ${got:0:12})"
 }
 
+# The exec backend's sync. rsync needs a remote shell; `filament exec` is one
+# as long as it passes rsync's argv across unchanged and keeps stdout clean
+# (it does: its own progress goes to stderr, and -q silences that too). When
+# the handshake fails anyway the fallback is a tar pipe through exec's stdin,
+# with the same excludes. RBUILD_EXEC_SYNC=rsync|tar pins one of the two.
+sync_exec() {
+  local ex=() e _ex mode="${RBUILD_EXEC_SYNC:-auto}" me owner rc=0 err rsh
+  IFS=',' read -ra _ex <<< "$SYNC_EXCLUDE"; for e in "${_ex[@]}"; do e="$(echo "$e" | tr -d '[:space:]')"; [ -n "$e" ] && ex+=(--exclude "$e"); done
+  me="$(hostname):$ROOT"
+  owner="$(fexec cat "$CS_DIR/.rbuild-source" 2>/dev/null | tr -d '\r\n' || true)"
+  if [ -n "$owner" ] && [ "$owner" != "$me" ] && [ "${RBUILD_TAKE_OVER:-0}" != 1 ]; then
+    echo "rbuild-cs: REFUSED: $CS_DIR on $CS_EXEC mirrors $owner, not $me." >&2
+    echo "           Use your own dir (RBUILD_CS_DIR=...) or RBUILD_TAKE_OVER=1 to claim it." >&2
+    return 3
+  fi
+  echo "rbuild-cs: sync $ROOT/ -> $CS_EXEC:$CS_DIR/ ${SYNC_EXCLUDE:+(excluding $SYNC_EXCLUDE)}"
+  fexec mkdir -p "$CS_DIR" >/dev/null 2>&1 || true
+  if [ "$mode" = auto ] || [ "$mode" = rsync ]; then
+    rb_need rsync; rsh="$(exec_rsh)"
+    err="$(rsync -az --delete -e "$rsh" --exclude .git --exclude target --exclude node_modules --exclude .rbuild-source "${ex[@]}" "$ROOT/" "exec:$CS_DIR/" 2>&1 >/dev/null)" || rc=$?
+    if [ "$rc" = 0 ]; then
+      fexec bash -lc "printf '%s' '$me' > '$CS_DIR/.rbuild-source'" >/dev/null 2>&1 || true
+      return 0
+    fi
+    printf '%s\n' "$err" >&2
+    [ "$mode" = rsync ] && return "$rc"
+    echo "rbuild-cs: rsync over filament exec failed (rc $rc); falling back to a tar pipe" >&2
+  fi
+  # tar pipe: one stream through exec's stdin. It adds and overwrites but does
+  # not delete, so a file removed locally survives on the peer until `clean`.
+  local tex=(); for e in "${ex[@]}"; do [ "$e" = --exclude ] || tex+=("--exclude=$e"); done
+  tar -C "$ROOT" -cz --exclude=.git --exclude=target --exclude=node_modules --exclude=.rbuild-source "${tex[@]}" . \
+    | fexec bash -lc "mkdir -p '$CS_DIR' && tar -C '$CS_DIR' -xzf - && printf '%s' '$me' > '$CS_DIR/.rbuild-source'" || {
+      echo "rbuild-cs: tar pipe over filament exec failed" >&2; return 1; }
+}
+
 cmd_sync() {
-  rb_need rsync
   ensure_up || return 1
+  if [ "$BACKEND" = exec ]; then sync_exec; return $?; fi
+  rb_need rsync
   local cfg host ex=(); cfg="$(ssh_cfg)" || { echo "rbuild-cs: cannot get ssh config for $CS" >&2; return 1; }
   host="$(ssh_host "$cfg")"
   IFS=',' read -ra _ex <<< "$SYNC_EXCLUDE"; for e in "${_ex[@]}"; do e="$(echo "$e" | tr -d '[:space:]')"; [ -n "$e" ] && ex+=(--exclude "$e"); done
@@ -458,6 +567,105 @@ cmd_dev() {
   fi
 }
 
+# THE SAVE-TRIGGERED LOOP. `watch` is `dev` on a trigger: it waits for the
+# working tree to change, debounces 300 ms so one save burst is one run, then
+# syncs and runs the same incremental cargo step, printing ONE line per
+# iteration. inotifywait (inotify-tools) is used as the wake-up when present;
+# without it the fallback is a 1 s poll over `git ls-files -co
+# --exclude-standard` (tracked plus untracked non-ignored files), minus
+# SYNC_EXCLUDE. Either way the decision to rebuild is made by comparing a
+# signature of names and mtimes, so an inotify event on an excluded or
+# ignored path costs nothing. Iterations a few seconds apart keep the ssh
+# mux (ControlPersist 10m) warm; an idle watch pokes the transport every
+# 4 minutes so the first save after lunch is not a fresh handshake.
+RB_WATCH_PID=""
+RB_WATCH_EXCL=""
+
+watch_sig() {  # names + mtimes of everything sync would send
+  local filt="$RB_WATCH_EXCL"
+  git -C "$ROOT" ls-files -co --exclude-standard -z 2>/dev/null \
+    | { if [ -n "$filt" ]; then grep -zvE "$filt"; else cat; fi; } \
+    | xargs -0 -r stat -c '%n %Y' 2>/dev/null | cksum
+}
+
+watch_wait() {  # watch_wait <baseline sig>: block until the tree differs, echo the new sig
+  local base="$1" cur idle=0
+  while :; do
+    if command -v inotifywait >/dev/null 2>&1; then
+      inotifywait -q -r -t 5 -e close_write,create,delete,move,modify \
+        --exclude '(/\.git/|/target/|/node_modules/)' "$ROOT" >/dev/null 2>&1 || true
+      idle=$((idle + 5))
+    else
+      sleep 1; idle=$((idle + 1))
+    fi
+    cur="$(watch_sig)"
+    if [ "$cur" != "$base" ]; then
+      sleep 0.3                      # debounce: collapse a burst of saves
+      watch_sig; return 0
+    fi
+    if [ "$idle" -ge 240 ]; then transport_ping >/dev/null 2>&1 || true; idle=0; fi
+  done
+}
+
+watch_stop() {
+  trap - INT
+  [ -n "$RB_WATCH_PID" ] && kill "$RB_WATCH_PID" 2>/dev/null
+  RB_WATCH_PID=""
+  echo; echo "rbuild-cs: watch stopped"
+  exit 0
+}
+
+watch_once() {  # watch_once <build|check> [cargo args...]
+  local mode="$1"; shift
+  local args=("$@") t0 t1 t2 rc=0 syncout tmp
+  t0=$(date +%s.%N)
+  if ! syncout="$(EXTRA=(); cmd_sync 2>&1)"; then
+    printf '%s  sync FAILED\n' "$(date +%T)"
+    printf '%s\n' "$syncout" | grep -v '^rbuild-cs: sync ' | head -5 | sed 's/^/  /'
+    return 1
+  fi
+  t1=$(date +%s.%N)
+  tmp="$(mktemp)"
+  remote "
+    ${CS_TARGET_DIR:+export CARGO_TARGET_DIR='$CS_TARGET_DIR';} cd '$CS_DIR/$MANIFEST_DIR' || exit 9
+    set -o pipefail
+    cargo $mode --profile dev ${args[*]:-} 2>&1 | { grep -vE '^\s*(Compiling|Checking|Downloaded|Downloading|Updating|Blocking|Finished)' || true; } | tail -40" > "$tmp" 2>&1 &
+  RB_WATCH_PID=$!
+  wait "$RB_WATCH_PID" || rc=$?
+  RB_WATCH_PID=""
+  t2=$(date +%s.%N)
+  local total sync; total="$(awk -v a="$t0" -v b="$t2" 'BEGIN{printf "%.1f", b-a}')"
+  sync="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')"
+  if [ "$rc" = 0 ]; then
+    printf '%s  %s ok  %ss  (sync %ss)\n' "$(date +%T)" "$mode" "$total" "$sync"
+  else
+    printf '%s  %s FAILED  %ss  (sync %ss)\n' "$(date +%T)" "$mode" "$total" "$sync"
+    grep -E '^(error|warning: unused)' -A2 "$tmp" 2>/dev/null | head -12 | sed 's/^/  /' \
+      || head -8 "$tmp" | sed 's/^/  /'
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+cmd_watch() {
+  local mode="build" args=() a e _ex
+  for a in "${EXTRA[@]:-}"; do case "$a" in --check) mode="check" ;; '') ;; *) args+=("$a") ;; esac; done
+  IFS=',' read -ra _ex <<< "$SYNC_EXCLUDE"
+  for e in "${_ex[@]}"; do e="$(echo "$e" | tr -d '[:space:]')"; [ -n "$e" ] && RB_WATCH_EXCL="${RB_WATCH_EXCL:+$RB_WATCH_EXCL|}^$e(/|$)"; done
+  local how="1 s poll"; command -v inotifywait >/dev/null 2>&1 && how="inotify"
+  echo "rbuild-cs: watch $ROOT ($how, debounce 300 ms) -> $CS: cargo $mode --profile dev ${args[*]:-}"
+  echo "rbuild-cs: ctrl-c to stop"
+  trap watch_stop INT
+  ensure_up || return 1
+  local sig; sig="$(watch_sig)"
+  watch_once "$mode" "${args[@]:-}"    # start from a synced tree
+  while :; do
+    sig="$(watch_wait "$sig")"
+    watch_once "$mode" "${args[@]:-}"
+    sig="$(watch_sig)"                 # ignore whatever the build itself touched
+  done
+}
+
 cmd_clean() {
   remote "
     for d in '$(work_root)'/*/target '$(work_root)'/*/*/target; do
@@ -467,6 +675,7 @@ cmd_clean() {
 
 cmd_down() {
   if [ -s "$(lease_file)" ] && [ "${IN_HOLDER:-0}" = 0 ]; then read -r pid _ < "$(lease_file)"; kill "$pid" 2>/dev/null; rm -f "$(lease_file)"; echo "rbuild-cs: lease ended"; fi
+  if [ "$BACKEND" = exec ]; then echo "rbuild-cs: $CS_EXEC is a persistent peer, nothing to stop"; return; fi
   if [ "$BACKEND" = ssh ]; then echo "rbuild-cs: $CS_SSH is a persistent host, nothing to stop"; return; fi
   if [ "$(state)" = "Shutdown" ]; then echo "rbuild-cs: already stopped"; return; fi
   gh codespace stop -c "$CS"; echo "rbuild-cs: stopped $CS"
@@ -481,8 +690,10 @@ case "$VERB" in
   run)    trap 'cmd_down' EXIT; cmd_build; cmd_fetch ;;
   sync)   cmd_sync ;;
   dev)    cmd_dev ;;
+  watch)  cmd_watch ;;
   session) cmd_session ;;
   sh)     if [ ${#EXTRA[@]} -gt 0 ]; then remote "${EXTRA[*]}"
+          elif [ "$BACKEND" = exec ]; then "$CS_EXEC_BIN" exec "$CS_EXEC" --tty -- bash -l
           elif [ "$BACKEND" = ssh ]; then cfg="$(ssh_cfg)" && ssh -F "$cfg" "$(ssh_host "$cfg")"
           else ensure_up && gh codespace ssh -c "$CS"; fi ;;
   clean)  cmd_clean ;;

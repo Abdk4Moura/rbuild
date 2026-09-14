@@ -18,16 +18,20 @@
 #   CS_SSH_PROXY  optional ProxyCommand for that host (e.g. filament forward --stdio host:22)
 #   CS_SSH_KEY    identity file for that host           (default ~/.ssh/rbuild_ed25519)
 #   CS_SSH_PORT   ssh port                              (default 22)
+#   CS_EXEC       filament device name of a build host reached over `filament exec`
+#                 instead of ssh (BACKEND=exec); no sshd and no key needed there
+#   CS_EXEC_BIN   the filament binary to use            (default: filament on PATH)
 #   SYNC_EXCLUDE  comma-separated paths `rbuild cs sync/dev` skip (besides .git, target, node_modules)
 #   CS_TARGET_DIR remote CARGO_TARGET_DIR; lets several checkouts (one CS_DIR per agent) share one
 #                 target dir on a small disk. cargo serializes concurrent builds on its lock.
-# BACKEND=codespace|ssh in a config file sets the default even when CS_SSH is set.
-# RBUILD_BACKEND=codespace ignores CS_SSH for one invocation (RBUILD_BACKEND=ssh
-# forces the other way). rb_load_config exports BACKEND as `ssh` or `codespace`.
+# BACKEND=codespace|ssh|exec in a config file sets the default even when CS_EXEC
+# or CS_SSH is set. Otherwise CS_EXEC picks exec, then CS_SSH picks ssh, else the
+# codespace. RBUILD_BACKEND=codespace ignores both for one invocation (=ssh or
+# =exec forces the other way). rb_load_config exports BACKEND as one of the three.
 
 rb_need() { command -v "$1" >/dev/null 2>&1 || { echo "rbuild: missing $1" >&2; exit 2; }; }
 
-RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT SYNC_EXCLUDE BACKEND CS_TARGET_DIR"
+RB_KEYS="MANIFEST_DIR BIN TARGET FEATURES DISPATCH_REPO CS CS_DIR CS_SSH CS_SSH_PROXY CS_SSH_KEY CS_SSH_PORT CS_EXEC CS_EXEC_BIN SYNC_EXCLUDE BACKEND CS_TARGET_DIR"
 
 rb_read_file() {  # rb_read_file <path>: assign every known KEY=VALUE line
   local k v
@@ -49,29 +53,42 @@ rb_load_config() {
   MANIFEST_DIR="."; BIN="$REPO_NAME"; TARGET="x86_64-unknown-linux-musl"; FEATURES=""
   DISPATCH_REPO="Abdk4Moura/rbuild"; CS=""; CS_DIR=""; SYNC_EXCLUDE=""
   CS_SSH=""; CS_SSH_PROXY=""; CS_SSH_KEY=""; CS_SSH_PORT=""; BACKEND=""; CS_TARGET_DIR=""
+  CS_EXEC=""; CS_EXEC_BIN=""
   local user_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/rbuild/config"
   [ -f "$user_cfg" ] && rb_read_file "$user_cfg"
   [ -f "$ROOT/.rbuild" ] && rb_read_file "$ROOT/.rbuild"
   local k; for k in $RB_KEYS; do
     local env="RBUILD_$k"; [ -n "${!env:-}" ] && printf -v "$k" '%s' "${!env}"
   done
-  # Backend: a persistent ssh host when CS_SSH is set, else the codespace.
-  # RBUILD_BACKEND=codespace keeps the codespace reachable from a box whose
-  # user config points at an ssh host.
+  # Backend: a filament peer when CS_EXEC is set, else a persistent ssh host
+  # when CS_SSH is set, else the codespace. RBUILD_BACKEND=codespace keeps the
+  # codespace reachable from a box whose user config points at a build host.
   case "${RBUILD_BACKEND:-}" in
     codespace) BACKEND=codespace ;;
     ssh) BACKEND=ssh; [ -n "$CS_SSH" ] || { echo "rbuild: RBUILD_BACKEND=ssh but CS_SSH is not set" >&2; exit 2; } ;;
-    '') # BACKEND=codespace|ssh from a config file picks the default explicitly;
-        # otherwise a configured CS_SSH host implies ssh.
+    exec) BACKEND=exec; [ -n "$CS_EXEC" ] || { echo "rbuild: RBUILD_BACKEND=exec but CS_EXEC is not set" >&2; exit 2; } ;;
+    '') # BACKEND=codespace|ssh|exec from a config file picks the default
+        # explicitly; otherwise CS_EXEC implies exec and CS_SSH implies ssh.
         case "$BACKEND" in
-          codespace|ssh) ;;
-          '') if [ -n "$CS_SSH" ]; then BACKEND=ssh; else BACKEND=codespace; fi ;;
-          *) echo "rbuild: BACKEND in config must be ssh or codespace (got $BACKEND)" >&2; exit 2 ;;
+          codespace|ssh|exec) ;;
+          '') if   [ -n "$CS_EXEC" ]; then BACKEND=exec
+              elif [ -n "$CS_SSH"  ]; then BACKEND=ssh
+              else BACKEND=codespace; fi ;;
+          *) echo "rbuild: BACKEND in config must be codespace, ssh or exec (got $BACKEND)" >&2; exit 2 ;;
         esac ;;
-    *) echo "rbuild: RBUILD_BACKEND must be ssh or codespace" >&2; exit 2 ;;
+    *) echo "rbuild: RBUILD_BACKEND must be codespace, ssh or exec" >&2; exit 2 ;;
   esac
   export BACKEND
-  if [ "$BACKEND" = ssh ]; then
+  if [ "$BACKEND" = exec ]; then
+    CS_EXEC_BIN="${CS_EXEC_BIN:-filament}"
+    # Same shape as the ssh backend: the checkout lives in ~/rbuild/<worktree>
+    # on the peer, resolved there, and a /workspaces/... path from a project
+    # .rbuild belongs to the codespace and is not carried over.
+    case "$CS_DIR" in ''|/workspaces/*) CS_DIR="~/rbuild/$(basename "$ROOT")" ;; esac
+    # CS names the cache and lease files for this target, never the project's
+    # codespace name, so a lease on one does not disturb the other.
+    CS="exec-$(printf '%s' "$CS_EXEC" | tr -c 'A-Za-z0-9._-' '_')"
+  elif [ "$BACKEND" = ssh ]; then
     CS_SSH_KEY="${CS_SSH_KEY:-$HOME/.ssh/rbuild_ed25519}"; CS_SSH_PORT="${CS_SSH_PORT:-22}"
     # Default ~/rbuild/<repo>, resolved on the remote; a /workspaces/... path
     # is the codespace's mount (a project .rbuild written for it) and is
