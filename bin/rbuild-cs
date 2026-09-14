@@ -584,6 +584,7 @@ cmd_dev() {
 # 4 minutes so the first save after lunch is not a fresh handshake.
 RB_WATCH_PID=""
 RB_WATCH_EXCL=""
+RB_WATCH_SIG=""
 
 watch_sig() {  # names + mtimes of everything sync would send
   local filt="$RB_WATCH_EXCL"
@@ -592,7 +593,10 @@ watch_sig() {  # names + mtimes of everything sync would send
     | xargs -0 -r stat -c '%n %Y' 2>/dev/null | cksum
 }
 
-watch_wait() {  # watch_wait <baseline sig>: block until the tree differs, echo the new sig
+# Blocks until the tree differs from the baseline, then sets RB_WATCH_SIG to
+# the new signature. Deliberately NOT called inside $( ): the sleep has to run
+# in this shell so ctrl-c reaches the trap instead of a command substitution.
+watch_wait() {  # watch_wait <baseline sig>
   local base="$1" cur idle=0
   while :; do
     if command -v inotifywait >/dev/null 2>&1; then
@@ -605,15 +609,26 @@ watch_wait() {  # watch_wait <baseline sig>: block until the tree differs, echo 
     cur="$(watch_sig)"
     if [ "$cur" != "$base" ]; then
       sleep 0.3                      # debounce: collapse a burst of saves
-      watch_sig; return 0
+      RB_WATCH_SIG="$(watch_sig)"; return 0
     fi
     if [ "$idle" -ge 240 ]; then transport_ping >/dev/null 2>&1 || true; idle=0; fi
   done
 }
 
+# Kill a job and everything it started. Killing the transport client alone
+# (ssh, or filament exec) ends the remote command with its channel, but the
+# local process tree has to go now, not when it notices.
+kill_tree() {
+  local p="$1" c
+  if command -v pgrep >/dev/null 2>&1; then
+    for c in $(pgrep -P "$p" 2>/dev/null); do kill_tree "$c"; done
+  fi
+  kill "$p" 2>/dev/null || true
+}
+
 watch_stop() {
   trap - INT
-  [ -n "$RB_WATCH_PID" ] && kill "$RB_WATCH_PID" 2>/dev/null
+  [ -n "$RB_WATCH_PID" ] && kill_tree "$RB_WATCH_PID"
   RB_WATCH_PID=""
   echo; echo "rbuild-cs: watch stopped"
   exit 0
@@ -664,7 +679,7 @@ cmd_watch() {
   local sig; sig="$(watch_sig)"
   watch_once "$mode" "${args[@]:-}"    # start from a synced tree
   while :; do
-    sig="$(watch_wait "$sig")"
+    watch_wait "$sig"; sig="$RB_WATCH_SIG"
     watch_once "$mode" "${args[@]:-}"
     sig="$(watch_sig)"                 # ignore whatever the build itself touched
   done
