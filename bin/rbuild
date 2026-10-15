@@ -111,7 +111,7 @@ fi
 if [ "$DOWNLOAD" = true ]; then
   mkdir -p "$OUT"; tmp="$(mktemp -d)"
   gh run download "$RUN_ID" -R "$DISPATCH_REPO" -n "$BIN-$TARGET-$PROFILE" -D "$tmp"
-  install -m 0755 "$tmp/$BIN" "$OUT/$BIN"; cp "$tmp/BUILD_INFO" "$OUT/BUILD_INFO"; rm -rf "$tmp"
+  f="$BIN"; [ -e "$tmp/$f" ] || f="$BIN.exe"; install -m 0755 "$tmp/$f" "$OUT/$f"; cp "$tmp/BUILD_INFO" "$OUT/BUILD_INFO"; rm -rf "$tmp"
   echo "rbuild: binary -> $OUT/$BIN"
   sed 's/^/rbuild:   /' "$OUT/BUILD_INFO"
 fi
