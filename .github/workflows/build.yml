@@ -167,6 +167,9 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -y -q gcc-aarch64-linux-gnu
           mkdir -p ~/.cargo
           printf '[target.%s]\nlinker = "aarch64-linux-gnu-gcc"\n' "${{ inputs.target }}" >> ~/.cargo/config.toml
+      - name: Windows (GNU) cross toolchain
+        if: contains(inputs.target, 'windows-gnu')
+        run: sudo apt-get update -q && sudo apt-get install -y -q mingw-w64
       - name: Toolchain
         shell: bash
         run: |
@@ -206,7 +209,12 @@ jobs:
           set -euo pipefail
           BIN="${{ inputs.manifest_dir }}/target/${{ inputs.target }}/${{ steps.build.outputs.outdir }}/${{ inputs.bin }}"
           mkdir -p out
-          cp "$BIN" "out/${{ inputs.bin }}"
+          # Windows targets name the binary <bin>.exe.
+          if [ ! -e "$BIN" ] && [ -e "$BIN.exe" ]; then
+            cp "$BIN.exe" "out/${{ inputs.bin }}.exe"
+          else
+            cp "$BIN" "out/${{ inputs.bin }}"
+          fi
           {
             echo "repo=${{ inputs.repo }}"
             echo "ref=${{ inputs.ref }}"
